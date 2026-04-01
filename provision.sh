@@ -156,13 +156,21 @@ nmcli connection add type wifi ifname wlan0 con-name hotspot \
 # NetBird VPN
 if [ -n "$NETBIRD_SETUP_KEY" ] && [ "$NETBIRD_SETUP_KEY" != "nb-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX" ]; then
     if ssh_cmd "which netbird" >/dev/null 2>&1; then
-        ssh_cmd "netbird up --setup-key '$NETBIRD_SETUP_KEY' 2>/dev/null &"
-        log "  NetBird VPN connecting..."
+        ssh_cmd "netbird up --setup-key '$NETBIRD_SETUP_KEY'" 2>/dev/null
+        NB_IP=$(ssh_cmd "netbird status 2>/dev/null | grep 'NetBird IP' | awk '{print \$NF}'" 2>/dev/null)
+        log "  NetBird VPN: connected ($NB_IP)"
     else
-        warn "  NetBird not installed in base image (build with --vpn netbird)"
+        warn "  NetBird not installed — rebuild base image"
     fi
 else
-    log "  NetBird: skipped (no setup key)"
+    log "  NetBird: skipped (no setup key in .env)"
+fi
+
+# Disable RNDIS if configured (dongle only reachable via LTE/NetBird after this)
+if [ "${DISABLE_RNDIS:-no}" = "yes" ]; then
+    warn "  Disabling RNDIS USB gadget (dongle only via LTE/NetBird!)"
+    ssh_cmd "systemctl disable usb-gadget.service 2>/dev/null && systemctl stop usb-gadget.service 2>/dev/null"
+    log "  RNDIS disabled — will not start on next boot"
 fi
 
 # ─── Step 5: Restart services ───────────────────────────────────────────────
