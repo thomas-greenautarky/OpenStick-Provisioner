@@ -1,0 +1,12 @@
+# Secrets
+.env
+*.key
+*.secret
+
+# Backups (device-specific calibration data)
+backup/
+
+# Build artifacts
+*.raw
+*.img
+.playwright-mcp/
