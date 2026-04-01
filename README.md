@@ -33,20 +33,30 @@ bash provision.sh
 ## What It Does
 
 ```
-┌─────────────────────────────────────────────────┐
-│  provision.sh                                    │
-│                                                  │
-│  1. Flash base image (calls OpenStick flash)     │
-│  2. Wait for boot + SSH                          │
-│  3. Copy device NV storage (IMEI/RF cal)         │
-│  4. Set APN from config                          │
-│  5. Set hostname (GA-XXXX from IMEI)             │
-│  6. Derive WiFi PSK (HMAC-SHA256)                │
-│  7. Configure WiFi hotspot                       │
-│  8. Set root password                            │
-│  9. Install NetBird VPN                          │
-│ 10. Run test suite                               │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  provision.sh                                     │
+│                                                   │
+│  1. Flash base image (calls OpenStick flash)      │
+│  2. Wait for boot + SSH                           │
+│  3. Copy device NV storage (IMEI/RF cal)          │
+│  4. Configure:                                    │
+│     - Hostname (GA-XXXX from IMEI)                │
+│     - APN (from provision.conf)                   │
+│     - Timezone                                    │
+│     - Root password                               │
+│     - WiFi hotspot (SSID + derived PSK)           │
+│     - NetBird VPN (setup key from .env)           │
+│     - RNDIS enable/disable                        │
+│  5. Verify all settings:                          │
+│     ✓ Hostname matches                            │
+│     ✓ APN config correct                          │
+│     ✓ Timezone set                                │
+│     ✓ WiFi AP active with correct SSID            │
+│     ✓ NetBird connected + IP                      │
+│     ✓ RNDIS state matches config                  │
+│     ✓ LTE connected                               │
+│  6. Run 48-test system test suite                 │
+└──────────────────────────────────────────────────┘
 ```
 
 ## WiFi PSK Derivation
@@ -63,16 +73,18 @@ The shared secret is in `.env` (never committed).
 
 ## Configuration
 
-| Setting | Source | Example |
-|---------|--------|---------|
-| APN | `provision.conf` | `internet.telekom` |
-| Timezone | `provision.conf` | `Europe/Berlin` |
-| WiFi secret | `.env` | 256-bit hex key |
-| NetBird key | `.env` | Setup key from dashboard |
-| Root password | `.env` | Chosen per fleet |
-| Hostname | Auto-derived | `GA-3112` (from IMEI) |
-| WiFi SSID | Auto-derived | `GA-3112` |
-| WiFi PSK | Auto-derived | HMAC-SHA256 output |
+| Setting | Source | Example | Verified |
+|---------|--------|---------|----------|
+| APN | `provision.conf` | `internet.telekom` | ✓ |
+| Timezone | `provision.conf` | `Europe/Berlin` | ✓ |
+| Disable RNDIS | `provision.conf` | `no` / `yes` | ✓ |
+| WiFi secret | `.env` | 256-bit hex key | — |
+| NetBird key | `.env` | Setup key from dashboard | ✓ connected |
+| Root password | `.env` | Chosen per fleet | — |
+| Hostname | Auto-derived | `ga-3112` (from IMEI) | ✓ |
+| WiFi SSID | Auto-derived | `GA-3112` | ✓ active |
+| WiFi PSK | Auto-derived | HMAC-SHA256 output | — |
+| LTE | Auto-connect | `connected` | ✓ |
 
 ## File Structure
 

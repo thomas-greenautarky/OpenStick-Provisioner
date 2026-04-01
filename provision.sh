@@ -132,7 +132,7 @@ ssh_cmd "echo '$APN' > /etc/default/lte-apn"
 log "  APN set: $APN"
 
 # Timezone
-ssh_cmd "timedatectl set-timezone '$TIMEZONE' 2>/dev/null || ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime"
+ssh_cmd "ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime && echo '$TIMEZONE' > /etc/timezone"
 log "  Timezone: $TIMEZONE"
 
 # Root password
@@ -173,15 +173,104 @@ if [ "${DISABLE_RNDIS:-no}" = "yes" ]; then
     log "  RNDIS disabled — will not start on next boot"
 fi
 
-# ─── Step 5: Restart services ───────────────────────────────────────────────
+# ─── Step 5: Verify configuration ────────────────────────────────────────────
 
-log "=== Step 5: Restart services ==="
+log "=== Step 5: Verify provisioning ==="
+VERIFY_FAIL=0
+
+# Verify hostname
+ACTUAL_HOST=$(ssh_cmd "hostname")
+if [ "$ACTUAL_HOST" = "$HOSTNAME" ]; then
+    log "  ✓ Hostname: $ACTUAL_HOST"
+else
+    warn "  ✗ Hostname: expected $HOSTNAME, got $ACTUAL_HOST"
+    VERIFY_FAIL=$((VERIFY_FAIL + 1))
+fi
+
+# Verify APN
+ACTUAL_APN=$(ssh_cmd "cat /etc/default/lte-apn | grep -v '^#' | head -1")
+if [ "$ACTUAL_APN" = "$APN" ]; then
+    log "  ✓ APN: $ACTUAL_APN"
+else
+    warn "  ✗ APN: expected $APN, got $ACTUAL_APN"
+    VERIFY_FAIL=$((VERIFY_FAIL + 1))
+fi
+
+# Verify timezone
+ACTUAL_TZ=$(ssh_cmd "cat /etc/timezone 2>/dev/null || readlink /etc/localtime | sed 's|.*/zoneinfo/||'")
+if echo "$ACTUAL_TZ" | grep -q "$TIMEZONE"; then
+    log "  ✓ Timezone: $ACTUAL_TZ"
+else
+    warn "  ✗ Timezone: expected $TIMEZONE, got $ACTUAL_TZ"
+    VERIFY_FAIL=$((VERIFY_FAIL + 1))
+fi
+
+# Verify WiFi hotspot active with correct SSID
+WIFI_STATE=$(ssh_cmd "nmcli -t -f NAME,TYPE,DEVICE connection show --active 2>/dev/null | grep hotspot")
+if [ -n "$WIFI_STATE" ]; then
+    ACTUAL_SSID=$(ssh_cmd "nmcli -t -f 802-11-wireless.ssid connection show hotspot 2>/dev/null")
+    if echo "$ACTUAL_SSID" | grep -q "$SSID"; then
+        log "  ✓ WiFi AP: $SSID (active on wlan0)"
+    else
+        warn "  ✗ WiFi SSID: expected $SSID, got $ACTUAL_SSID"
+        VERIFY_FAIL=$((VERIFY_FAIL + 1))
+    fi
+else
+    warn "  ✗ WiFi hotspot: not active"
+    VERIFY_FAIL=$((VERIFY_FAIL + 1))
+fi
+
+# Verify NetBird
+if [ -n "$NETBIRD_SETUP_KEY" ] && [ "$NETBIRD_SETUP_KEY" != "nb-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX" ]; then
+    NB_STATUS=$(ssh_cmd "netbird status 2>/dev/null | grep -i 'status.*connected\|Management.*Connected' | head -1")
+    if echo "$NB_STATUS" | grep -qi "connected"; then
+        NB_IP=$(ssh_cmd "netbird status 2>/dev/null | grep 'NetBird IP' | awk '{print \$NF}'")
+        log "  ✓ NetBird: connected ($NB_IP)"
+    else
+        warn "  ✗ NetBird: not connected"
+        VERIFY_FAIL=$((VERIFY_FAIL + 1))
+    fi
+fi
+
+# Verify RNDIS state matches config
+if [ "${DISABLE_RNDIS:-no}" = "yes" ]; then
+    GADGET=$(ssh_cmd "systemctl is-enabled usb-gadget 2>/dev/null")
+    if [ "$GADGET" = "disabled" ] || [ "$GADGET" = "masked" ]; then
+        log "  ✓ RNDIS: disabled (as configured)"
+    else
+        warn "  ✗ RNDIS: still enabled ($GADGET)"
+        VERIFY_FAIL=$((VERIFY_FAIL + 1))
+    fi
+else
+    GADGET=$(ssh_cmd "systemctl is-active usb-gadget 2>/dev/null")
+    if [ "$GADGET" = "active" ]; then
+        log "  ✓ RNDIS: active"
+    else
+        warn "  ✗ RNDIS: not active ($GADGET)"
+        VERIFY_FAIL=$((VERIFY_FAIL + 1))
+    fi
+fi
+
+# Verify LTE connected
+LTE_STATE=$(ssh_cmd "mmcli -m 0 -K 2>/dev/null | grep 'modem.generic.state ' | awk -F': ' '{print \$2}' | xargs | awk '{print \$1}'")
+if [ "$LTE_STATE" = "connected" ]; then
+    log "  ✓ LTE: connected"
+else
+    warn "  ✗ LTE: $LTE_STATE"
+    VERIFY_FAIL=$((VERIFY_FAIL + 1))
+fi
+
+if [ "$VERIFY_FAIL" -gt 0 ]; then
+    warn "  $VERIFY_FAIL verification(s) failed!"
+else
+    log "  All verifications passed"
+fi
+
+# ─── Step 6: Restart services + run test suite ───────────────────────────────
+
+log "=== Step 6: System test ==="
 ssh_cmd "systemctl restart modem-autoconnect 2>/dev/null || true"
 sleep 10
-
-# ─── Step 6: Run test suite ──────────────────────────────────────────────────
-
-log "=== Step 6: Verification ==="
 bash "$OPENSTICK_DIR/flash/test-dongle.sh" "$DONGLE_IP" "$DONGLE_PASS"
 
 echo ""
