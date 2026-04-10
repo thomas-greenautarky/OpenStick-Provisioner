@@ -2,6 +2,7 @@
 .env
 *.key
 *.secret
+database.conf
 
 # Backups (device-specific calibration data)
 backup/

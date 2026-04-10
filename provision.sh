@@ -6,9 +6,12 @@
 # WiFi PSK derivation, APN, NetBird VPN, hostname, credentials.
 #
 # Usage:
-#   bash provision.sh                    # interactive (prompts for EDL)
-#   bash provision.sh --skip-flash       # skip flash, only configure (dongle already running)
-#   bash provision.sh --test-only        # only run test suite
+#   bash provision.sh                              # interactive (QR scan prompt + flash)
+#   bash provision.sh --qr-code SIM-WIN-00000001   # skip QR prompt, use value directly
+#   bash provision.sh --skip-flash                  # skip flash, only configure
+#   bash provision.sh --skip-flash --qr-code XXX    # combine flags
+#   bash provision.sh --firmware-version v1.1        # override version (default from provision.conf)
+#   bash provision.sh --test-only                    # only run test suite
 #
 # Prerequisites:
 #   - .env file with secrets (copy from .env.example)
@@ -56,19 +59,47 @@ derive_wifi_psk() {
 
 SKIP_FLASH=false
 TEST_ONLY=false
+TEST_PROVISION=false
+QR_CODE=""
+FW_VERSION=""
 
-case "${1:-}" in
-    --skip-flash) SKIP_FLASH=true ;;
-    --test-only)  TEST_ONLY=true ;;
-esac
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --skip-flash)        SKIP_FLASH=true; shift ;;
+        --test-only)         TEST_ONLY=true; shift ;;
+        --test-provision)    TEST_PROVISION=true; shift ;;
+        --qr-code)           QR_CODE="$2"; shift 2 ;;
+        --firmware-version)  FW_VERSION="$2"; shift 2 ;;
+        *) err "Unknown option: $1" ;;
+    esac
+done
+
+FIRMWARE_VERSION="${FW_VERSION:-${FIRMWARE_VERSION:-v1.0}}"
 
 # ─── Test only ───────────────────────────────────────────────────────────────
 
 if $TEST_ONLY; then
-    log "Running test suite..."
-    bash "$OPENSTICK_DIR/flash/test-dongle.sh"
+    log "Running hardware test suite..."
+    bash "$OPENSTICK_DIR/flash/test-dongle.sh" "$DONGLE_IP" "$DONGLE_PASS"
     exit $?
 fi
+
+if $TEST_PROVISION; then
+    log "Running provisioning test suite..."
+    bash "$SCRIPT_DIR/test-provision.sh" "$DONGLE_IP" "$DONGLE_PASS"
+    exit $?
+fi
+
+# ─── Step 0: QR code ────────────────────────────────────────────────────────
+
+if [ -z "$QR_CODE" ]; then
+    log "=== Step 0: QR Code ==="
+    echo -ne "${GREEN}[+]${NC} Scan QR code (or type manually): "
+    read -r QR_CODE
+    QR_CODE=$(echo "$QR_CODE" | tr -d '[:space:]')
+    [ -n "$QR_CODE" ] || err "No QR code provided."
+fi
+log "  QR Code: $QR_CODE"
 
 # ─── Step 1: Flash base image ───────────────────────────────────────────────
 
@@ -115,7 +146,22 @@ SSID="GA-${LAST4}"
 PSK=$(derive_wifi_psk "$SSID")
 HOSTNAME="ga-${LAST4}"
 
+# Read hardware serial number (try device tree, then cpuinfo, then eMMC CID)
+SERIAL_NUMBER=$(ssh_cmd "cat /sys/firmware/devicetree/base/serial-number 2>/dev/null | tr -d '\0'" || true)
+if [ -z "$SERIAL_NUMBER" ]; then
+    SERIAL_NUMBER=$(ssh_cmd "grep -i '^Serial' /proc/cpuinfo 2>/dev/null | awk '{print \$3}'" || true)
+fi
+if [ -z "$SERIAL_NUMBER" ]; then
+    SERIAL_NUMBER=$(ssh_cmd "cat /sys/block/mmcblk0/device/cid 2>/dev/null | tr -d '\0'" || true)
+fi
+
+# Read SIM phone number
+PHONE_NUMBER=$(ssh_cmd "mmcli -m 0 -K 2>/dev/null | grep 'modem.generic.own-numbers.value' | awk -F': ' '{print \$2}' | xargs" || true)
+[ -z "$PHONE_NUMBER" ] || [ "$PHONE_NUMBER" = "--" ] && PHONE_NUMBER=""
+
 log "  IMEI:     $IMEI"
+log "  Serial:   ${SERIAL_NUMBER:-unknown}"
+log "  Phone:    ${PHONE_NUMBER:-unknown}"
 log "  Hostname: $HOSTNAME"
 log "  WiFi:     $SSID / $PSK"
 
@@ -173,97 +219,27 @@ if [ "${DISABLE_RNDIS:-no}" = "yes" ]; then
     log "  RNDIS disabled — will not start on next boot"
 fi
 
-# ─── Step 5: Verify configuration ────────────────────────────────────────────
+# ─── Step 5: Verify provisioning ────────────────────────────────────────────
 
 log "=== Step 5: Verify provisioning ==="
-VERIFY_FAIL=0
+bash "$SCRIPT_DIR/test-provision.sh" "$DONGLE_IP" "$DONGLE_PASS" && VERIFY_FAIL=0 || VERIFY_FAIL=$?
 
-# Verify hostname
-ACTUAL_HOST=$(ssh_cmd "hostname")
-if [ "$ACTUAL_HOST" = "$HOSTNAME" ]; then
-    log "  ✓ Hostname: $ACTUAL_HOST"
-else
-    warn "  ✗ Hostname: expected $HOSTNAME, got $ACTUAL_HOST"
-    VERIFY_FAIL=$((VERIFY_FAIL + 1))
-fi
+# ─── Record to database (only on success) ───────────────────────────────────
 
-# Verify APN
-ACTUAL_APN=$(ssh_cmd "cat /etc/default/lte-apn | grep -v '^#' | head -1")
-if [ "$ACTUAL_APN" = "$APN" ]; then
-    log "  ✓ APN: $ACTUAL_APN"
-else
-    warn "  ✗ APN: expected $APN, got $ACTUAL_APN"
-    VERIFY_FAIL=$((VERIFY_FAIL + 1))
-fi
-
-# Verify timezone
-ACTUAL_TZ=$(ssh_cmd "cat /etc/timezone 2>/dev/null || readlink /etc/localtime | sed 's|.*/zoneinfo/||'")
-if echo "$ACTUAL_TZ" | grep -q "$TIMEZONE"; then
-    log "  ✓ Timezone: $ACTUAL_TZ"
-else
-    warn "  ✗ Timezone: expected $TIMEZONE, got $ACTUAL_TZ"
-    VERIFY_FAIL=$((VERIFY_FAIL + 1))
-fi
-
-# Verify WiFi hotspot active with correct SSID
-WIFI_STATE=$(ssh_cmd "nmcli -t -f NAME,TYPE,DEVICE connection show --active 2>/dev/null | grep hotspot")
-if [ -n "$WIFI_STATE" ]; then
-    ACTUAL_SSID=$(ssh_cmd "nmcli -t -f 802-11-wireless.ssid connection show hotspot 2>/dev/null")
-    if echo "$ACTUAL_SSID" | grep -q "$SSID"; then
-        log "  ✓ WiFi AP: $SSID (active on wlan0)"
+DB_STATUS="skipped"
+if [ "$VERIFY_FAIL" -eq 0 ]; then
+    source "$SCRIPT_DIR/db.sh"
+    if db_load_config; then
+        db_init && \
+        db_record_device "$IMEI" "${SERIAL_NUMBER:-}" "$QR_CODE" "$FIRMWARE_VERSION" \
+            "${PHONE_NUMBER:-}" "${NB_IP:-}" "$HOSTNAME" "$HOSTNAME" && \
+            DB_STATUS="recorded" || DB_STATUS="failed"
     else
-        warn "  ✗ WiFi SSID: expected $SSID, got $ACTUAL_SSID"
-        VERIFY_FAIL=$((VERIFY_FAIL + 1))
+        DB_STATUS="no config"
     fi
+    [ "$DB_STATUS" = "recorded" ] && log "DB: device recorded" || warn "DB: $DB_STATUS"
 else
-    warn "  ✗ WiFi hotspot: not active"
-    VERIFY_FAIL=$((VERIFY_FAIL + 1))
-fi
-
-# Verify NetBird
-if [ -n "$NETBIRD_SETUP_KEY" ] && [ "$NETBIRD_SETUP_KEY" != "nb-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX" ]; then
-    NB_STATUS=$(ssh_cmd "netbird status 2>/dev/null | grep -i 'status.*connected\|Management.*Connected' | head -1")
-    if echo "$NB_STATUS" | grep -qi "connected"; then
-        NB_IP=$(ssh_cmd "netbird status 2>/dev/null | grep 'NetBird IP' | awk '{print \$NF}'")
-        log "  ✓ NetBird: connected ($NB_IP)"
-    else
-        warn "  ✗ NetBird: not connected"
-        VERIFY_FAIL=$((VERIFY_FAIL + 1))
-    fi
-fi
-
-# Verify RNDIS state matches config
-if [ "${DISABLE_RNDIS:-no}" = "yes" ]; then
-    GADGET=$(ssh_cmd "systemctl is-enabled usb-gadget 2>/dev/null")
-    if [ "$GADGET" = "disabled" ] || [ "$GADGET" = "masked" ]; then
-        log "  ✓ RNDIS: disabled (as configured)"
-    else
-        warn "  ✗ RNDIS: still enabled ($GADGET)"
-        VERIFY_FAIL=$((VERIFY_FAIL + 1))
-    fi
-else
-    GADGET=$(ssh_cmd "systemctl is-active usb-gadget 2>/dev/null")
-    if [ "$GADGET" = "active" ]; then
-        log "  ✓ RNDIS: active"
-    else
-        warn "  ✗ RNDIS: not active ($GADGET)"
-        VERIFY_FAIL=$((VERIFY_FAIL + 1))
-    fi
-fi
-
-# Verify LTE connected
-LTE_STATE=$(ssh_cmd "mmcli -m 0 -K 2>/dev/null | grep 'modem.generic.state ' | awk -F': ' '{print \$2}' | xargs | awk '{print \$1}'")
-if [ "$LTE_STATE" = "connected" ]; then
-    log "  ✓ LTE: connected"
-else
-    warn "  ✗ LTE: $LTE_STATE"
-    VERIFY_FAIL=$((VERIFY_FAIL + 1))
-fi
-
-if [ "$VERIFY_FAIL" -gt 0 ]; then
-    warn "  $VERIFY_FAIL verification(s) failed!"
-else
-    log "  All verifications passed"
+    warn "DB: skipped (provisioning verification failed)"
 fi
 
 # ─── Step 6: Restart services + run test suite ───────────────────────────────
@@ -277,7 +253,12 @@ echo ""
 log "═══════════════════════════════════════"
 log "  Provisioning complete!"
 log "  Device:    $HOSTNAME ($IMEI)"
+log "  Serial:    ${SERIAL_NUMBER:-unknown}"
+log "  QR Code:   $QR_CODE"
+log "  Phone:     ${PHONE_NUMBER:-unknown}"
+log "  Firmware:  $FIRMWARE_VERSION"
 log "  WiFi:      $SSID"
 log "  SSH:       ssh root@$DONGLE_IP"
 log "  APN:       $APN"
+log "  DB:        $DB_STATUS"
 log "═══════════════════════════════════════"

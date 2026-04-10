@@ -1,0 +1,11 @@
+# PostgreSQL Database Configuration
+# Used by db.sh for dongle inventory tracking
+#
+# Copy this file to database.conf and fill in your credentials:
+#   cp database.conf.example database.conf
+host=10.0.1.154
+port=5432
+dbname=ga_database
+user=root
+password=your_password_here
+schema=dongle_flasher
