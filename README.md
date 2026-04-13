@@ -80,6 +80,7 @@ bash provision.sh --test-only
 │  provision.sh                                          │
 │                                                        │
 │  0. QR Code scan (Bluetooth scanner or --qr-code)     │
+│  0a. Route guard (pin host gateway, block dongle GW)  │
 │  1. Flash base image (calls OpenStick flash)           │
 │  2. Wait for boot + SSH                                │
 │  3. Device identification:                             │
@@ -94,7 +95,7 @@ bash provision.sh --test-only
 │     - Root password                                    │
 │     - WiFi hotspot (SSID + derived PSK)                │
 │     - NetBird VPN (setup key from .env)                │
-│     - RNDIS enable/disable                             │
+│     - RNDIS enable/disable + mode (gateway/local)      │
 │  5. Verify provisioning (test-provision.sh):            │
 │     ✓ Device identity (IMEI, serial, hostname)         │
 │     ✓ SIM card + phone number                          │
@@ -102,12 +103,34 @@ bash provision.sh --test-only
 │     ✓ Network config (APN, timezone)                   │
 │     ✓ LTE connectivity (state + ping)                  │
 │     ✓ NetBird VPN (connected + IP)                     │
-│     ✓ RNDIS state matches config                       │
+│     ✓ RNDIS state + mode matches config                │
 │     ✓ Database record exists                           │
 │  ── Record to database (only if all checks pass) ──   │
 │  6. Run hardware test suite (test-dongle.sh)           │
 └───────────────────────────────────────────────────────┘
 ```
+
+## Route Guard
+
+When the dongle boots with RNDIS enabled, it presents a USB ethernet interface
+with a DHCP server that may advertise a default gateway (`192.168.68.1`). If the
+host laptop accepts this route, all internet traffic gets routed through the
+dongle's LTE connection — breaking downloads, SSH tunnels, and anything else on
+the provisioning machine.
+
+The route guard prevents this by:
+
+1. **Pinning the host's current default gateway** at metric 0 before the dongle
+   boots, so it always wins route selection.
+2. **Running a background loop** that watches for and removes any default route
+   via `192.168.68.1` as soon as it appears.
+3. **Cleaning up on exit** via `trap` — the background loop is stopped and the
+   pinned route is removed when `provision.sh` finishes.
+
+Route manipulation requires `sudo`. The script uses `sudo -n` (non-interactive)
+so it never blocks on a password prompt. If `sudo` is unavailable, the route
+guard is skipped with a warning — provisioning continues but the host's internet
+may be disrupted while the dongle is connected.
 
 ## QR Code Scanning
 
@@ -242,7 +265,7 @@ bash test-provision.sh 192.168.68.1 mypassword  # custom host + pass
 bash provision.sh --test-provision
 ```
 
-**Test sections (8 sections, ~20 checks):**
+**Test sections (9 sections, ~25 checks):**
 
 | # | Section | Tests | Description |
 |---|---------|-------|-------------|
@@ -253,6 +276,7 @@ bash provision.sh --test-provision
 | 5 | **LTE Connectivity** | Modem state, ping | Modem connected, ping to 8.8.8.8 succeeds |
 | 6 | **NetBird VPN** | Status, IP | Connected + IP assigned (skip if no setup key) |
 | 7 | **RNDIS** | State | Matches `DISABLE_RNDIS` from config |
+| 7a | **RNDIS Mode** | dnsmasq, iptables, forwarding | `gateway`: NAT + forwarding active; `local`: no gateway/DNS/NAT on USB |
 | 8 | **Database** | Connection, record | DB reachable, record exists for this IMEI (skip if no `database.conf`) |
 
 **Exit codes:**
@@ -329,6 +353,7 @@ The shared secret is in `.env` (never committed).
 | `WIFI_CHANNEL` | `6` | WiFi AP channel |
 | `WIFI_BAND` | `bg` | WiFi band (`bg` = 2.4 GHz) |
 | `DISABLE_RNDIS` | `no` | Disable USB ethernet gadget after provisioning |
+| `RNDIS_MODE` | `local` | USB network mode: `gateway` (share LTE internet) or `local` (SSH only, no internet sharing) |
 | `FIRMWARE_VERSION` | `v1.0` | Image version label for DB tracking |
 
 ### Secrets (`.env`)

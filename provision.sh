@@ -101,6 +101,71 @@ if [ -z "$QR_CODE" ]; then
 fi
 log "  QR Code: $QR_CODE"
 
+# ─── Route Guard: prevent host from routing internet through dongle ─────────
+
+ROUTE_GUARD_NM_CON=""
+ROUTE_GUARD_MODIFIED_CONS=()
+
+start_route_guard() {
+    # Prevent the host from routing internet through the dongle by telling
+    # NetworkManager to never use ANY USB ethernet interface as a default route.
+    # The dongle's MAC (and thus interface name) changes after flashing, so we
+    # must match by wildcard pattern, not by a specific interface name.
+
+    local nm_con="dongle-provision"
+
+    # Delete stale profile from a previous run (ignore errors)
+    nmcli connection delete "$nm_con" 2>/dev/null || true
+
+    # Create a catch-all profile that matches any USB ethernet interface (enx*)
+    # with never-default so NM never installs a default route through it.
+    nmcli connection add type ethernet con-name "$nm_con" \
+        match.interface-name "enx*" \
+        ipv4.never-default yes ipv4.dns-priority 200 \
+        ipv6.method disabled connection.autoconnect yes \
+        connection.autoconnect-priority 100 2>/dev/null && \
+        log "Route guard: created NM profile '$nm_con' (matches enx*)" || \
+        warn "Could not create NM connection — host internet may be disrupted"
+
+    ROUTE_GUARD_NM_CON="$nm_con"
+
+    # Also fix any existing active connections on USB ethernet devices (enx*)
+    # IMPORTANT: filter by DEVICE name, not connection name — matching by name
+    # (e.g. "wired", "kabel") would accidentally hit the host's main ethernet.
+    local usb_cons
+    usb_cons=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null \
+        | grep -i ':enx' \
+        | grep -iv "$nm_con" \
+        | cut -d: -f1)
+    if [ -n "$usb_cons" ]; then
+        while IFS= read -r con; do
+            nmcli connection modify "$con" ipv4.never-default yes ipv4.dns-priority 200 2>/dev/null && \
+                log "Route guard: also set '$con' to never-default" && \
+                ROUTE_GUARD_MODIFIED_CONS+=("$con") || true
+        done <<< "$usb_cons"
+    fi
+}
+
+stop_route_guard() {
+    # Remove the catch-all NM profile and restore only the connections we modified
+    if [ -n "$ROUTE_GUARD_NM_CON" ]; then
+        nmcli connection delete "$ROUTE_GUARD_NM_CON" 2>/dev/null || true
+        log "Route guard: removed NM profile '$ROUTE_GUARD_NM_CON'"
+
+        for con in "${ROUTE_GUARD_MODIFIED_CONS[@]}"; do
+            nmcli connection modify "$con" ipv4.never-default no ipv4.dns-priority 0 2>/dev/null || true
+        done
+        ROUTE_GUARD_MODIFIED_CONS=()
+        ROUTE_GUARD_NM_CON=""
+    fi
+}
+
+# Always clean up route guard on exit
+trap 'stop_route_guard' EXIT
+
+log "Protecting host internet connection..."
+start_route_guard
+
 # ─── Step 1: Flash base image ───────────────────────────────────────────────
 
 if ! $SKIP_FLASH; then
@@ -217,11 +282,46 @@ if [ "${DISABLE_RNDIS:-no}" = "yes" ]; then
     warn "  Disabling RNDIS USB gadget (dongle only via LTE/NetBird!)"
     ssh_cmd "systemctl disable usb-gadget.service 2>/dev/null && systemctl stop usb-gadget.service 2>/dev/null"
     log "  RNDIS disabled — will not start on next boot"
+elif [ "${RNDIS_MODE:-gateway}" = "local" ]; then
+    log "  RNDIS mode: local (SSH only, no internet sharing)"
+    # Remove default gateway and DNS from dnsmasq DHCP options so the host
+    # does not re-route its traffic through the dongle.
+    ssh_cmd "
+        # Override dnsmasq config for usb0: hand out IP only, no gateway/DNS
+        cat > /etc/dnsmasq.d/usb-local.conf <<'DNSMASQ'
+# RNDIS local mode — DHCP without gateway or DNS
+# Clients get an IP but keep their own default route and DNS
+dhcp-option=usb0,3
+dhcp-option=usb0,6
+DNSMASQ
+        # NOTE: We keep MASQUERADE rules — they are needed for WiFi hotspot
+        # clients to reach the internet via LTE. Local mode only prevents the
+        # USB host from routing through the dongle (no gateway/DNS + no forwarding).
+
+        # Disable IP forwarding for usb0 (blocks USB→LTE routing)
+        echo 0 > /proc/sys/net/ipv4/conf/usb0/forwarding
+        # Make forwarding change persistent via sysctl
+        mkdir -p /etc/sysctl.d
+        echo 'net.ipv4.conf.usb0.forwarding=0' > /etc/sysctl.d/90-rndis-local.conf
+        # Restart dnsmasq to pick up new config
+        systemctl restart dnsmasq 2>/dev/null || true
+    "
+    log "  RNDIS local mode configured (no gateway/DNS/NAT on USB)"
+    # Dongle no longer advertises a gateway — safe to stop the host-side route guard
+    stop_route_guard
+else
+    log "  RNDIS mode: gateway (default — internet sharing enabled)"
+    stop_route_guard
 fi
 
 # ─── Step 5: Verify provisioning ────────────────────────────────────────────
 
 log "=== Step 5: Verify provisioning ==="
+# Wait for SSH to come back (dnsmasq restart in RNDIS local mode briefly drops USB network)
+for i in $(seq 1 12); do
+    ssh_cmd "echo OK" 2>/dev/null | grep -q OK && break
+    sleep 5
+done
 bash "$SCRIPT_DIR/test-provision.sh" "$DONGLE_IP" "$DONGLE_PASS" && VERIFY_FAIL=0 || VERIFY_FAIL=$?
 
 # ─── Record to database (only on success) ───────────────────────────────────
@@ -258,6 +358,7 @@ log "  QR Code:   $QR_CODE"
 log "  Phone:     ${PHONE_NUMBER:-unknown}"
 log "  Firmware:  $FIRMWARE_VERSION"
 log "  WiFi:      $SSID"
+log "  RNDIS:    ${DISABLE_RNDIS:-no} (mode: ${RNDIS_MODE:-gateway})"
 log "  SSH:       ssh root@$DONGLE_IP"
 log "  APN:       $APN"
 log "  DB:        $DB_STATUS"

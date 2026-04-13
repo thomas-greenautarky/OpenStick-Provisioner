@@ -240,6 +240,78 @@ else
     else
         fail "RNDIS" "expected active, got $GADGET"
     fi
+
+    # ─── 7a. RNDIS Mode ───────────────────────────────────────────────────
+    RNDIS_MODE_CFG="${RNDIS_MODE:-gateway}"
+    echo ""
+    echo "── 7a. RNDIS Mode ($RNDIS_MODE_CFG) ──"
+
+    if [ "$RNDIS_MODE_CFG" = "local" ]; then
+        # Local mode: no gateway, no DNS, no NAT on USB
+
+        # Check dnsmasq drop-in exists
+        DNSMASQ_LOCAL=$(ssh_cmd "cat /etc/dnsmasq.d/usb-local.conf 2>/dev/null")
+        if echo "$DNSMASQ_LOCAL" | grep -q "dhcp-option=usb0,3"; then
+            pass "dnsmasq: no gateway option on usb0"
+        else
+            fail "dnsmasq gateway" "usb-local.conf missing dhcp-option=usb0,3"
+        fi
+
+        if echo "$DNSMASQ_LOCAL" | grep -q "dhcp-option=usb0,6"; then
+            pass "dnsmasq: no DNS option on usb0"
+        else
+            fail "dnsmasq DNS" "usb-local.conf missing dhcp-option=usb0,6"
+        fi
+
+        # MASQUERADE rules may exist (needed for WiFi hotspot clients).
+        # Local mode relies on usb0 forwarding=0 to block USB→LTE routing.
+        MASQ=$(ssh_cmd "iptables -t nat -S POSTROUTING 2>/dev/null | grep MASQUERADE")
+        if [ -n "$MASQ" ]; then
+            pass "iptables: MASQUERADE present (needed for WiFi hotspot)"
+        else
+            skip "iptables MASQUERADE" "no rules (hotspot may not route to internet)"
+        fi
+
+        # Check IP forwarding disabled for usb0
+        FWD=$(ssh_cmd "cat /proc/sys/net/ipv4/conf/usb0/forwarding 2>/dev/null")
+        if [ "$FWD" = "0" ]; then
+            pass "IP forwarding: disabled on usb0"
+        else
+            fail "IP forwarding" "expected 0 on usb0, got $FWD"
+        fi
+
+        # Check sysctl persistence
+        SYSCTL=$(ssh_cmd "cat /etc/sysctl.d/90-rndis-local.conf 2>/dev/null")
+        if echo "$SYSCTL" | grep -q "net.ipv4.conf.usb0.forwarding=0"; then
+            pass "sysctl: usb0 forwarding=0 persisted"
+        else
+            fail "sysctl persistence" "90-rndis-local.conf missing or wrong"
+        fi
+
+    else
+        # Gateway mode: NAT + forwarding should be active
+
+        MASQ=$(ssh_cmd "iptables -t nat -S POSTROUTING 2>/dev/null | grep MASQUERADE")
+        if [ -n "$MASQ" ]; then
+            pass "iptables: MASQUERADE active (gateway mode)"
+        else
+            fail "iptables MASQUERADE" "expected MASQUERADE rule for gateway mode"
+        fi
+
+        FWD=$(ssh_cmd "cat /proc/sys/net/ipv4/conf/usb0/forwarding 2>/dev/null")
+        if [ "$FWD" = "1" ]; then
+            pass "IP forwarding: enabled on usb0"
+        else
+            fail "IP forwarding" "expected 1 on usb0, got $FWD"
+        fi
+
+        # Verify no local-mode override is present
+        if ssh_cmd "test -f /etc/dnsmasq.d/usb-local.conf" 2>/dev/null; then
+            fail "dnsmasq config" "usb-local.conf should not exist in gateway mode"
+        else
+            pass "dnsmasq: no local-mode override (gateway mode)"
+        fi
+    fi
 fi
 
 # ─── 8. Database ───────────────────────────────────────────────────────────
