@@ -101,70 +101,22 @@ if [ -z "$QR_CODE" ]; then
 fi
 log "  QR Code: $QR_CODE"
 
-# ─── Route Guard: prevent host from routing internet through dongle ─────────
+# ─── Route Guard: verify permanent NM profile exists ─────────────────────────
+# A permanent NM profile "dongle-no-route" must exist on the host to prevent
+# USB ethernet (enx*) from becoming the default route. Install once with:
+#   nmcli connection add type ethernet con-name "dongle-no-route" \
+#       match.interface-name "enx*" ipv4.never-default yes ipv4.dns-priority 200 \
+#       ipv6.method disabled connection.autoconnect yes connection.autoconnect-priority 100
 
-ROUTE_GUARD_NM_CON=""
-ROUTE_GUARD_MODIFIED_CONS=()
-
-start_route_guard() {
-    # Prevent the host from routing internet through the dongle by telling
-    # NetworkManager to never use ANY USB ethernet interface as a default route.
-    # The dongle's MAC (and thus interface name) changes after flashing, so we
-    # must match by wildcard pattern, not by a specific interface name.
-
-    local nm_con="dongle-provision"
-
-    # Delete stale profile from a previous run (ignore errors)
-    nmcli connection delete "$nm_con" 2>/dev/null || true
-
-    # Create a catch-all profile that matches any USB ethernet interface (enx*)
-    # with never-default so NM never installs a default route through it.
-    nmcli connection add type ethernet con-name "$nm_con" \
-        match.interface-name "enx*" \
-        ipv4.never-default yes ipv4.dns-priority 200 \
-        ipv6.method disabled connection.autoconnect yes \
-        connection.autoconnect-priority 100 2>/dev/null && \
-        log "Route guard: created NM profile '$nm_con' (matches enx*)" || \
-        warn "Could not create NM connection — host internet may be disrupted"
-
-    ROUTE_GUARD_NM_CON="$nm_con"
-
-    # Also fix any existing active connections on USB ethernet devices (enx*)
-    # IMPORTANT: filter by DEVICE name, not connection name — matching by name
-    # (e.g. "wired", "kabel") would accidentally hit the host's main ethernet.
-    local usb_cons
-    usb_cons=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null \
-        | grep -i ':enx' \
-        | grep -iv "$nm_con" \
-        | cut -d: -f1)
-    if [ -n "$usb_cons" ]; then
-        while IFS= read -r con; do
-            nmcli connection modify "$con" ipv4.never-default yes ipv4.dns-priority 200 2>/dev/null && \
-                log "Route guard: also set '$con' to never-default" && \
-                ROUTE_GUARD_MODIFIED_CONS+=("$con") || true
-        done <<< "$usb_cons"
-    fi
-}
-
-stop_route_guard() {
-    # Remove the catch-all NM profile and restore only the connections we modified
-    if [ -n "$ROUTE_GUARD_NM_CON" ]; then
-        nmcli connection delete "$ROUTE_GUARD_NM_CON" 2>/dev/null || true
-        log "Route guard: removed NM profile '$ROUTE_GUARD_NM_CON'"
-
-        for con in "${ROUTE_GUARD_MODIFIED_CONS[@]}"; do
-            nmcli connection modify "$con" ipv4.never-default no ipv4.dns-priority 0 2>/dev/null || true
-        done
-        ROUTE_GUARD_MODIFIED_CONS=()
-        ROUTE_GUARD_NM_CON=""
-    fi
-}
-
-# Always clean up route guard on exit
-trap 'stop_route_guard' EXIT
-
-log "Protecting host internet connection..."
-start_route_guard
+if nmcli connection show dongle-no-route >/dev/null 2>&1; then
+    log "Route guard: permanent NM profile 'dongle-no-route' active"
+else
+    warn "Route guard: 'dongle-no-route' NM profile not found!"
+    warn "Host internet may be disrupted. Install with:"
+    warn "  nmcli connection add type ethernet con-name dongle-no-route \\"
+    warn "    match.interface-name 'enx*' ipv4.never-default yes ipv4.dns-priority 200 \\"
+    warn "    ipv6.method disabled connection.autoconnect yes connection.autoconnect-priority 100"
+fi
 
 # ─── Step 1: Flash base image ───────────────────────────────────────────────
 
@@ -307,11 +259,8 @@ DNSMASQ
         systemctl restart dnsmasq 2>/dev/null || true
     "
     log "  RNDIS local mode configured (no gateway/DNS/NAT on USB)"
-    # Dongle no longer advertises a gateway — safe to stop the host-side route guard
-    stop_route_guard
 else
     log "  RNDIS mode: gateway (default — internet sharing enabled)"
-    stop_route_guard
 fi
 
 # ─── Step 5: Verify provisioning ────────────────────────────────────────────
