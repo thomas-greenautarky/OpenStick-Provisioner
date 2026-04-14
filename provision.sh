@@ -15,7 +15,8 @@
 #
 # Prerequisites:
 #   - .env file with secrets (copy from .env.example)
-#   - USB-Dongle-OpenStick repo built (rootfs.raw + boot.img ready)
+#   - USB-Dongle-OpenStick repo built (auto-copies images to flash/files/)
+#   - "dongle-no-route" NM profile installed on host (see README)
 #   - Dongle in EDL mode (for flash) or booted (for configure-only)
 
 set -e

@@ -19,9 +19,7 @@ git clone https://github.com/thomas-greenautarky/OpenStick-Provisioner.git
 # 2. Build the base image (once)
 cd USB-Dongle-OpenStick
 docker build -t openstick-builder build/
-docker run --rm --privileged -v $(pwd)/build/output:/output openstick-builder
-simg2img build/output/rootfs.img flash/files/rootfs.raw
-cp build/output/boot.img flash/files/boot.img
+docker run --rm --privileged -v $(pwd)/build/output:/output -v $(pwd)/build:/build openstick-builder
 
 # 3. Set up secrets + database config
 cd ../OpenStick-Provisioner
@@ -33,7 +31,12 @@ cp database.conf.example database.conf
 sudo apt install sshpass postgresql-client
 pipx install edlclient
 
-# 5. Flash + provision a dongle
+# 5. Set up route protection (once per provisioning machine)
+nmcli connection add type ethernet con-name "dongle-no-route" \
+    match.interface-name "enx*" ipv4.never-default yes ipv4.dns-priority 200 \
+    ipv6.method disabled connection.autoconnect yes connection.autoconnect-priority 100
+
+# 6. Flash + provision a dongle
 #    - Enter EDL: hold reset button while plugging in USB
 bash provision.sh
 ```
@@ -80,7 +83,7 @@ bash provision.sh --test-only
 │  provision.sh                                          │
 │                                                        │
 │  0. QR Code scan (Bluetooth scanner or --qr-code)     │
-│  0a. Route guard (pin host gateway, block dongle GW)  │
+│  0a. Route guard check (dongle-no-route NM profile)   │
 │  1. Flash base image (calls OpenStick flash)           │
 │  2. Wait for boot + SSH                                │
 │  3. Device identification:                             │
@@ -113,24 +116,25 @@ bash provision.sh --test-only
 ## Route Guard
 
 When the dongle boots with RNDIS enabled, it presents a USB ethernet interface
-with a DHCP server that may advertise a default gateway (`192.168.68.1`). If the
-host laptop accepts this route, all internet traffic gets routed through the
-dongle's LTE connection — breaking downloads, SSH tunnels, and anything else on
-the provisioning machine.
+(`enx*`) with a DHCP server that may advertise a default gateway. If the host
+accepts this route, all internet traffic gets routed through the dongle's LTE
+connection — breaking the provisioning machine's internet.
 
-The route guard prevents this by:
+This is prevented by a **permanent NetworkManager profile** installed once on the
+host machine. It matches all USB ethernet interfaces and ensures they never
+become the default route:
 
-1. **Pinning the host's current default gateway** at metric 0 before the dongle
-   boots, so it always wins route selection.
-2. **Running a background loop** that watches for and removes any default route
-   via `192.168.68.1` as soon as it appears.
-3. **Cleaning up on exit** via `trap` — the background loop is stopped and the
-   pinned route is removed when `provision.sh` finishes.
+```bash
+# Install once per provisioning machine (survives reboots)
+nmcli connection add type ethernet con-name "dongle-no-route" \
+    match.interface-name "enx*" \
+    ipv4.never-default yes ipv4.dns-priority 200 \
+    ipv6.method disabled connection.autoconnect yes \
+    connection.autoconnect-priority 100
+```
 
-Route manipulation requires `sudo`. The script uses `sudo -n` (non-interactive)
-so it never blocks on a password prompt. If `sudo` is unavailable, the route
-guard is skipped with a warning — provisioning continues but the host's internet
-may be disrupted while the dongle is connected.
+The provisioner checks for this profile at startup and warns if it's missing.
+No `sudo` or cleanup required — the profile is persistent and stateless.
 
 ## QR Code Scanning
 
