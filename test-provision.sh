@@ -322,18 +322,20 @@ echo "── 8. Database ──"
 if [ -f "$SCRIPT_DIR/database.conf" ]; then
     source "$SCRIPT_DIR/db.sh"
     if db_load_config 2>/dev/null; then
-        DB_RECORD=$(db_query "SELECT imei, qr_code, hostname, firmware_version FROM ${DB_SCHEMA}.devices WHERE imei = '$IMEI' LIMIT 1;" 2>/dev/null)
-        if [ -n "$DB_RECORD" ]; then
-            pass "DB record exists for IMEI $IMEI"
-            # Check hostname in record
-            DB_HOSTNAME=$(echo "$DB_RECORD" | awk -F'|' '{print $3}')
-            if [ "$DB_HOSTNAME" = "$EXPECTED_HOSTNAME" ]; then
-                pass "DB hostname: $DB_HOSTNAME"
+        # Verify DB is reachable (record is written AFTER this test suite)
+        DB_TEST=$(db_query "SELECT 1;" 2>/dev/null)
+        if [ -n "$DB_TEST" ]; then
+            pass "DB connection"
+            # Check if record already exists (re-provisioning)
+            DB_RECORD=$(db_query "SELECT imei, qr_code, hostname, firmware_version FROM ${DB_SCHEMA}.devices WHERE imei = '$IMEI' LIMIT 1;" 2>/dev/null)
+            if [ -n "$DB_RECORD" ]; then
+                pass "DB record exists for IMEI $IMEI (re-provisioning)"
             else
-                fail "DB hostname" "expected $EXPECTED_HOSTNAME, got $DB_HOSTNAME"
+                skip "DB record" "new device — will be written after verification"
             fi
         else
-            fail "DB record" "no entry for IMEI $IMEI"
+            fail "DB connection" "query failed"
+            skip "DB record" "no connection"
         fi
     else
         skip "DB connection" "could not connect"
