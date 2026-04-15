@@ -21,6 +21,9 @@
 
 set -e
 
+# Ensure pipx binaries (edl) are in PATH
+export PATH="$HOME/.local/bin:$PATH"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
