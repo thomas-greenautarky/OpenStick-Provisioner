@@ -106,6 +106,14 @@ if [ -z "$QR_CODE" ]; then
     QR_CODE=$(echo "$QR_CODE" | tr -d '[:space:]')
     [ -n "$QR_CODE" ] || err "No QR code provided."
 fi
+
+# Validate QR code format: SIM-WIN-XXXXXXXX (8 digits)
+if ! echo "$QR_CODE" | grep -qE '^SIM-WIN-[0-9]{8}$'; then
+    err "Invalid QR code format: '$QR_CODE'
+  Expected: SIM-WIN-XXXXXXXX (e.g. SIM-WIN-00000001)
+  Got:      $QR_CODE
+  Please re-scan or type the correct code."
+fi
 log "  QR Code: $QR_CODE"
 
 # ─── Route Guard: verify permanent NM profile exists ─────────────────────────
