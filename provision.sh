@@ -228,20 +228,36 @@ if [ -z "$IMEI" ] || [ "$IMEI" = "--" ]; then
 fi
 
 if [ -z "$IMEI" ] || [ "$IMEI" = "--" ]; then
-    echo ""
-    err "IMEI not readable. Possible causes:
-  - Modem firmware partition not restored (check flash log for 'modem.bin' errors)
-  - Modem NV storage (modemst1/2) missing or corrupt
-  - Hardware modem issue
+    if $PREP_MODE; then
+        # In prep mode: try to recover IMEI from the ADB backup (saved during flash)
+        warn "IMEI not readable from modem (no SIM → ModemManager fails on some boards)"
+        BACKUP_IMEI=""
+        for info_file in "$OPENSTICK_DIR"/backup/stock_uz801_*/device_info.txt; do
+            [ -f "$info_file" ] || continue
+            CANDIDATE=$(grep -oP 'IMEI: \K[0-9]+' "$info_file" 2>/dev/null | tail -1)
+            # Match by checking if this backup was created today (most recent flash)
+            if [ -n "$CANDIDATE" ] && echo "$info_file" | grep -q "$(date +%Y%m%d)"; then
+                BACKUP_IMEI="$CANDIDATE"
+            fi
+        done
+        if [ -n "$BACKUP_IMEI" ]; then
+            IMEI="$BACKUP_IMEI"
+            log "  IMEI recovered from ADB backup: $IMEI"
+        else
+            err "IMEI not readable and no backup found. Cannot identify device."
+        fi
+    else
+        echo ""
+        err "IMEI not readable. Possible causes:
+  - No SIM card inserted (required for full provisioning)
+  - Modem firmware not restored (check flash log for errors)
+  - Use --prep mode for provisioning without SIM
 
   Diagnostics (run on dongle via SSH):
     mmcli -m 0                          # modem status
-    ls /boot/modem_fs*                  # NV storage files
     ls /lib/firmware/modem.mdt          # modem firmware
-    systemctl status rmtfs              # remote filesystem service
-
-  The IMEI is burned into the modem hardware and must be readable
-  regardless of SIM card presence. If missing, the flash was incomplete."
+    systemctl status rmtfs              # remote filesystem service"
+    fi
 fi
 
 LAST4="${IMEI: -4}"
