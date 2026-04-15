@@ -123,11 +123,37 @@ fi
 
 if ! $SKIP_FLASH; then
     log "=== Step 1: Flash base image ==="
-    [ -f "$OPENSTICK_DIR/flash/files/rootfs.raw" ] || err "rootfs.raw not found. Build first: cd $OPENSTICK_DIR && docker run ..."
-    [ -f "$OPENSTICK_DIR/flash/files/boot.img" ] || err "boot.img not found."
+
+    # Auto-detect dongle type and choose flash script
+    if lsusb 2>/dev/null | grep -q "05c6:f00e\|05c6:90b6"; then
+        # Stock Android dongle (UZ801 type) — use lk2nd-based flash
+        log "  Detected: UZ801 (Stock Android)"
+        FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-uz801.sh"
+        [ -f "$FLASH_SCRIPT" ] || err "flash-uz801.sh not found at $FLASH_SCRIPT"
+    elif lsusb 2>/dev/null | grep -q "05c6:9008"; then
+        # EDL mode — could be either type. Check if uz801 files exist.
+        if [ -f "$OPENSTICK_DIR/flash/files/uz801/aboot.mbn" ]; then
+            log "  Detected: EDL mode (using UZ801 flash with lk2nd)"
+            FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-uz801.sh"
+        else
+            log "  Detected: EDL mode (using JZ0145-v33 flash)"
+            FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-openstick.sh"
+        fi
+    elif lsusb 2>/dev/null | grep -q "18d1:d00d"; then
+        # Fastboot/lk2nd — already has lk2nd, use uz801 flash
+        log "  Detected: Fastboot/lk2nd"
+        FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-uz801.sh"
+    else
+        # No dongle detected — default to original flash (prompts for EDL)
+        log "  No dongle detected — using default flash script"
+        FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-openstick.sh"
+    fi
+
+    [ -f "$FLASH_SCRIPT" ] || err "Flash script not found: $FLASH_SCRIPT"
+    log "  Flash script: $(basename $FLASH_SCRIPT)"
 
     cd "$OPENSTICK_DIR/flash"
-    bash flash-openstick.sh
+    bash "$FLASH_SCRIPT"
     cd "$SCRIPT_DIR"
 fi
 
