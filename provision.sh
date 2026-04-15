@@ -147,9 +147,34 @@ if ! $SKIP_FLASH; then
         log "  Detected: Fastboot/lk2nd"
         FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-uz801.sh"
     else
-        # No dongle detected — default to original flash (prompts for EDL)
-        log "  No dongle detected — using default flash script"
-        FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-openstick.sh"
+        # No dongle detected — wait for one
+        warn "No dongle detected. Please plug in a dongle now."
+        warn "  UZ801:     Plug in normally (boots to Stock Android in ~15s)"
+        warn "  JZ0145-v33: Hold reset pin + plug in USB (hold 10-15s)"
+        echo ""
+        echo -ne "${GREEN}[+]${NC} Waiting for dongle..."
+        for i in $(seq 1 30); do
+            if lsusb 2>/dev/null | grep -q "05c6:f00e\|05c6:90b6"; then
+                echo " UZ801 detected!"
+                FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-uz801.sh"
+                break
+            elif lsusb 2>/dev/null | grep -q "05c6:9008"; then
+                echo " EDL detected!"
+                if [ -f "$OPENSTICK_DIR/flash/files/uz801/aboot.mbn" ]; then
+                    FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-uz801.sh"
+                else
+                    FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-openstick.sh"
+                fi
+                break
+            elif lsusb 2>/dev/null | grep -q "18d1:d00d"; then
+                echo " Fastboot/lk2nd detected!"
+                FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-uz801.sh"
+                break
+            fi
+            echo -n "."
+            sleep 2
+        done
+        [ -n "$FLASH_SCRIPT" ] || err "No dongle detected after 60s."
     fi
 
     [ -f "$FLASH_SCRIPT" ] || err "Flash script not found: $FLASH_SCRIPT"
@@ -178,17 +203,38 @@ ssh-keygen -f "$HOME/.ssh/known_hosts" -R "$DONGLE_IP" 2>/dev/null || true
 # ─── Step 3: Read IMEI + derive identifiers ─────────────────────────────────
 
 log "=== Step 3: Device identification ==="
+
+# Try to enable modem first (may be in failed state without SIM)
+ssh_cmd "mmcli -m 0 --enable 2>/dev/null" || true
+sleep 3
+
 IMEI=$(ssh_cmd "mmcli -m 0 -K 2>/dev/null | grep modem.3gpp.imei | awk -F': ' '{print \$2}' | xargs")
 
 if [ -z "$IMEI" ] || [ "$IMEI" = "--" ]; then
-    warn "IMEI not available yet. Waiting 60s for modem..."
-    sleep 60
+    warn "IMEI not available yet. Waiting 30s for modem..."
+    sleep 30
     IMEI=$(ssh_cmd "mmcli -m 0 -K 2>/dev/null | grep modem.3gpp.imei | awk -F': ' '{print \$2}' | xargs")
 fi
 
-[ -n "$IMEI" ] && [ "$IMEI" != "--" ] || err "Cannot read IMEI. Is modem firmware + NV storage copied?"
+if [ -z "$IMEI" ] || [ "$IMEI" = "--" ]; then
+    warn "IMEI not readable (no SIM card? modem firmware missing?)"
+    warn "Falling back to eMMC CID for device identification."
+    IMEI=""
 
-LAST4="${IMEI: -4}"
+    # Use eMMC CID as fallback identifier
+    EMMC_CID=$(ssh_cmd "cat /sys/block/mmcblk0/device/cid 2>/dev/null | tr -d '\0'" || true)
+    if [ -n "$EMMC_CID" ]; then
+        LAST4="${EMMC_CID: -4}"
+        log "  eMMC CID: $EMMC_CID (using last 4: $LAST4)"
+    else
+        # Last resort: random 4 digits
+        LAST4=$(printf "%04d" $((RANDOM % 10000)))
+        warn "  No identifier found — using random: $LAST4"
+    fi
+else
+    LAST4="${IMEI: -4}"
+fi
+
 SSID="GA-${LAST4}"
 PSK=$(derive_wifi_psk "$SSID")
 HOSTNAME="ga-${LAST4}"
