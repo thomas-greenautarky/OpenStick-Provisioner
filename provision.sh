@@ -204,7 +204,7 @@ ssh-keygen -f "$HOME/.ssh/known_hosts" -R "$DONGLE_IP" 2>/dev/null || true
 
 log "=== Step 3: Device identification ==="
 
-# Try to enable modem first (may be in failed state without SIM)
+# Try to enable modem first (may need a kick after boot)
 ssh_cmd "mmcli -m 0 --enable 2>/dev/null" || true
 sleep 3
 
@@ -217,24 +217,23 @@ if [ -z "$IMEI" ] || [ "$IMEI" = "--" ]; then
 fi
 
 if [ -z "$IMEI" ] || [ "$IMEI" = "--" ]; then
-    warn "IMEI not readable (no SIM card? modem firmware missing?)"
-    warn "Falling back to eMMC CID for device identification."
-    IMEI=""
+    echo ""
+    err "IMEI not readable. Possible causes:
+  - Modem firmware partition not restored (check flash log for 'modem.bin' errors)
+  - Modem NV storage (modemst1/2) missing or corrupt
+  - Hardware modem issue
 
-    # Use eMMC CID as fallback identifier
-    EMMC_CID=$(ssh_cmd "cat /sys/block/mmcblk0/device/cid 2>/dev/null | tr -d '\0'" || true)
-    if [ -n "$EMMC_CID" ]; then
-        LAST4="${EMMC_CID: -4}"
-        log "  eMMC CID: $EMMC_CID (using last 4: $LAST4)"
-    else
-        # Last resort: random 4 digits
-        LAST4=$(printf "%04d" $((RANDOM % 10000)))
-        warn "  No identifier found — using random: $LAST4"
-    fi
-else
-    LAST4="${IMEI: -4}"
+  Diagnostics (run on dongle via SSH):
+    mmcli -m 0                          # modem status
+    ls /boot/modem_fs*                  # NV storage files
+    ls /lib/firmware/modem.mdt          # modem firmware
+    systemctl status rmtfs              # remote filesystem service
+
+  The IMEI is burned into the modem hardware and must be readable
+  regardless of SIM card presence. If missing, the flash was incomplete."
 fi
 
+LAST4="${IMEI: -4}"
 SSID="GA-${LAST4}"
 PSK=$(derive_wifi_psk "$SSID")
 HOSTNAME="ga-${LAST4}"
