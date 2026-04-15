@@ -8,10 +8,11 @@
 # Usage:
 #   bash provision.sh                              # interactive (QR scan prompt + flash)
 #   bash provision.sh --qr-code SIM-WIN-00000001   # skip QR prompt, use value directly
-#   bash provision.sh --skip-flash                  # skip flash, only configure
-#   bash provision.sh --skip-flash --qr-code XXX    # combine flags
-#   bash provision.sh --firmware-version v1.1        # override version (default from provision.conf)
-#   bash provision.sh --test-only                    # only run test suite
+#   bash provision.sh --prep                         # prep mode: flash + base config (no SIM needed)
+#   bash provision.sh --skip-flash                   # skip flash, only configure
+#   bash provision.sh --skip-flash --qr-code XXX     # combine flags
+#   bash provision.sh --firmware-version v1.1         # override version (default from provision.conf)
+#   bash provision.sh --test-only                     # only run test suite
 #
 # Prerequisites:
 #   - .env file with secrets (copy from .env.example)
@@ -64,6 +65,7 @@ derive_wifi_psk() {
 SKIP_FLASH=false
 TEST_ONLY=false
 TEST_PROVISION=false
+PREP_MODE=false
 QR_CODE=""
 FW_VERSION=""
 
@@ -72,6 +74,7 @@ while [[ $# -gt 0 ]]; do
         --skip-flash)        SKIP_FLASH=true; shift ;;
         --test-only)         TEST_ONLY=true; shift ;;
         --test-provision)    TEST_PROVISION=true; shift ;;
+        --prep)              PREP_MODE=true; shift ;;
         --qr-code)           QR_CODE="$2"; shift 2 ;;
         --firmware-version)  FW_VERSION="$2"; shift 2 ;;
         *) err "Unknown option: $1" ;;
@@ -291,8 +294,10 @@ nmcli connection add type wifi ifname wlan0 con-name hotspot \
     autoconnect yes 2>/dev/null
 " && log "  WiFi: $SSID (PSK derived)" || warn "  WiFi config failed (wcnss firmware missing?)"
 
-# NetBird VPN
-if [ -n "$NETBIRD_SETUP_KEY" ] && [ "$NETBIRD_SETUP_KEY" != "nb-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX" ]; then
+# NetBird VPN (requires internet — skip in prep mode)
+if $PREP_MODE; then
+    log "  NetBird: skipped (prep mode, no internet)"
+elif [ -n "$NETBIRD_SETUP_KEY" ] && [ "$NETBIRD_SETUP_KEY" != "nb-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX" ]; then
     if ssh_cmd "which netbird" >/dev/null 2>&1; then
         ssh_cmd "netbird up --setup-key '$NETBIRD_SETUP_KEY'" 2>/dev/null
         NB_IP=$(ssh_cmd "netbird status 2>/dev/null | grep 'NetBird IP' | awk '{print \$NF}'" 2>/dev/null)
@@ -338,37 +343,43 @@ else
     log "  RNDIS mode: gateway (default — internet sharing enabled)"
 fi
 
-# ─── Step 5: Verify provisioning ────────────────────────────────────────────
+# ─── Step 5: Verify provisioning (full mode only) ──────────────────────────
 
-log "=== Step 5: Verify provisioning ==="
-# Wait for SSH to come back (dnsmasq restart in RNDIS local mode briefly drops USB network)
-for i in $(seq 1 12); do
-    ssh_cmd "echo OK" 2>/dev/null | grep -q OK && break
-    sleep 5
-done
-bash "$SCRIPT_DIR/test-provision.sh" "$DONGLE_IP" "$DONGLE_PASS" && VERIFY_FAIL=0 || VERIFY_FAIL=$?
-
-# ─── Record to database (only on success) ───────────────────────────────────
-
+VERIFY_FAIL=0
 DB_STATUS="skipped"
-if [ "$VERIFY_FAIL" -eq 0 ]; then
-    source "$SCRIPT_DIR/db.sh"
-    if db_load_config; then
-        db_init && \
-        db_record_device "$IMEI" "${SERIAL_NUMBER:-}" "$QR_CODE" "$FIRMWARE_VERSION" \
-            "${PHONE_NUMBER:-}" "${NB_IP:-}" "$HOSTNAME" "$HOSTNAME" && \
-            DB_STATUS="recorded" || DB_STATUS="failed"
-    else
-        DB_STATUS="no config"
-    fi
-    [ "$DB_STATUS" = "recorded" ] && log "DB: device recorded" || warn "DB: $DB_STATUS"
+
+if $PREP_MODE; then
+    log "=== Step 5: Verify — skipped (prep mode) ==="
+    log "=== Step 6: DB — skipped (prep mode) ==="
 else
-    warn "DB: skipped (provisioning verification failed)"
+    log "=== Step 5: Verify provisioning ==="
+    # Wait for SSH to come back (dnsmasq restart in RNDIS local mode briefly drops USB network)
+    for i in $(seq 1 12); do
+        ssh_cmd "echo OK" 2>/dev/null | grep -q OK && break
+        sleep 5
+    done
+    bash "$SCRIPT_DIR/test-provision.sh" "$DONGLE_IP" "$DONGLE_PASS" && VERIFY_FAIL=0 || VERIFY_FAIL=$?
+
+    # ─── Record to database (only on success) ───────────────────────────────
+    if [ "$VERIFY_FAIL" -eq 0 ]; then
+        source "$SCRIPT_DIR/db.sh"
+        if db_load_config; then
+            db_init && \
+            db_record_device "$IMEI" "${SERIAL_NUMBER:-}" "$QR_CODE" "$FIRMWARE_VERSION" \
+                "${PHONE_NUMBER:-}" "${NB_IP:-}" "$HOSTNAME" "$HOSTNAME" && \
+                DB_STATUS="recorded" || DB_STATUS="failed"
+        else
+            DB_STATUS="no config"
+        fi
+        [ "$DB_STATUS" = "recorded" ] && log "DB: device recorded" || warn "DB: $DB_STATUS"
+    else
+        warn "DB: skipped (provisioning verification failed)"
+    fi
 fi
 
-# ─── Step 6: Restart services + run test suite ───────────────────────────────
+# ─── Step 7: Restart services + run test suite ───────────────────────────────
 
-log "=== Step 6: System test ==="
+log "=== Step 7: System test ==="
 ssh_cmd "systemctl restart modem-autoconnect 2>/dev/null || true"
 sleep 10
 bash "$OPENSTICK_DIR/flash/test-dongle.sh" "$DONGLE_IP" "$DONGLE_PASS"
@@ -386,4 +397,13 @@ log "  RNDIS:    ${DISABLE_RNDIS:-no} (mode: ${RNDIS_MODE:-gateway})"
 log "  SSH:       ssh root@$DONGLE_IP"
 log "  APN:       $APN"
 log "  DB:        $DB_STATUS"
-log "═══════════════════════════════════════"
+if $PREP_MODE; then
+    log "  Status:    PREP (flash + base config, no SIM)"
+    log "═══════════════════════════════════════"
+    echo ""
+    log "Next steps:"
+    log "  1. Insert SIM card"
+    log "  2. Run: ./provision.sh --skip-flash --qr-code $QR_CODE"
+else
+    log "═══════════════════════════════════════"
+fi
