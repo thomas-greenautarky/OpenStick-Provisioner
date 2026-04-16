@@ -219,12 +219,16 @@ log "=== Step 3: Device identification ==="
 ssh_cmd "mmcli -m 0 --enable 2>/dev/null" || true
 sleep 3
 
+# Try multiple IMEI sources: 3gpp.imei (enabled modem) or equipment-identifier (always available)
 IMEI=$(ssh_cmd "mmcli -m 0 -K 2>/dev/null | grep modem.3gpp.imei | awk -F': ' '{print \$2}' | xargs")
+if [ -z "$IMEI" ] || [ "$IMEI" = "--" ]; then
+    IMEI=$(ssh_cmd "mmcli -m 0 -K 2>/dev/null | grep modem.generic.equipment-identifier | awk -F': ' '{print \$2}' | xargs")
+fi
 
 if [ -z "$IMEI" ] || [ "$IMEI" = "--" ]; then
     warn "IMEI not available yet. Waiting 30s for modem..."
     sleep 30
-    IMEI=$(ssh_cmd "mmcli -m 0 -K 2>/dev/null | grep modem.3gpp.imei | awk -F': ' '{print \$2}' | xargs")
+    IMEI=$(ssh_cmd "mmcli -m 0 -K 2>/dev/null | grep modem.generic.equipment-identifier | awk -F': ' '{print \$2}' | xargs")
 fi
 
 if [ -z "$IMEI" ] || [ "$IMEI" = "--" ]; then
