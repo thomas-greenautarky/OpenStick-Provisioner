@@ -37,19 +37,19 @@ log "Creating NM profile 'dongle-local' for USB dongle interfaces..."
 # This avoids matching real USB ethernet adapters (r8152, asix, etc.)
 nmcli connection add type ethernet con-name "dongle-local" \
     match.driver "rndis_host" \
-    ipv4.method manual \
-    ipv4.addresses "192.168.68.100/24" \
+    ipv4.method auto \
     ipv4.never-default yes \
     ipv4.dns "" \
     ipv4.dns-priority 999 \
+    ipv4.ignore-auto-dns yes \
     ipv6.method disabled \
     connection.autoconnect yes \
     connection.autoconnect-priority 100 2>/dev/null
 
 log "Profile 'dongle-local' created:"
 log "  Match:      driver=rndis_host (RNDIS dongles only, not real ethernet)"
-log "  IP:         192.168.68.100/24 (static, no DHCP)"
-log "  DNS:        none (host DNS untouched)"
+log "  IP:         DHCP (works for both Stock Android and flashed dongles)"
+log "  DNS:        ignored (host DNS untouched)"
 log "  Route:      never-default (host internet untouched)"
 
 # Check dependencies
