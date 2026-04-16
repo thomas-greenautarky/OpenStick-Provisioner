@@ -17,7 +17,7 @@
 # Prerequisites:
 #   - .env file with secrets (copy from .env.example)
 #   - USB-Dongle-OpenStick repo built (auto-copies images to flash/files/)
-#   - "dongle-no-route" NM profile installed on host (see README)
+#   - "dongle-local" NM profile installed on host (see README)
 #   - Dongle in EDL mode (for flash) or booted (for configure-only)
 
 set -e
@@ -117,18 +117,18 @@ fi
 log "  QR Code: $QR_CODE"
 
 # ─── Route Guard: verify permanent NM profile exists ─────────────────────────
-# A permanent NM profile "dongle-no-route" must exist on the host to prevent
+# A permanent NM profile "dongle-local" must exist on the host to prevent
 # USB ethernet (enx*) from becoming the default route. Install once with:
-#   nmcli connection add type ethernet con-name "dongle-no-route" \
+#   nmcli connection add type ethernet con-name "dongle-local" \
 #       match.interface-name "enx*" ipv4.never-default yes ipv4.dns-priority 200 \
 #       ipv6.method disabled connection.autoconnect yes connection.autoconnect-priority 100
 
-if nmcli connection show dongle-no-route >/dev/null 2>&1; then
-    log "Route guard: permanent NM profile 'dongle-no-route' active"
+if nmcli connection show dongle-local >/dev/null 2>&1; then
+    log "Route guard: permanent NM profile 'dongle-local' active"
 else
-    warn "Route guard: 'dongle-no-route' NM profile not found!"
+    warn "Route guard: 'dongle-local' NM profile not found!"
     warn "Host internet may be disrupted. Install with:"
-    warn "  nmcli connection add type ethernet con-name dongle-no-route \\"
+    warn "  nmcli connection add type ethernet con-name dongle-local \\"
     warn "    match.interface-name 'enx*' ipv4.never-default yes ipv4.dns-priority 200 \\"
     warn "    ipv6.method disabled connection.autoconnect yes connection.autoconnect-priority 100"
 fi
