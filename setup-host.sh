@@ -32,9 +32,11 @@ for old in "dongle-no-route" "dongle-unmanaged" "dongle-local" "dongle-provision
 done
 
 # Create the USB dongle profile
-log "Creating NM profile 'dongle-local' for USB dongle interfaces (enx*)..."
+log "Creating NM profile 'dongle-local' for USB dongle interfaces..."
+# Match by driver 'rndis_host' (= RNDIS USB gadget from flashed dongles)
+# This avoids matching real USB ethernet adapters (r8152, asix, etc.)
 nmcli connection add type ethernet con-name "dongle-local" \
-    match.interface-name "enx*" \
+    match.driver "rndis_host" \
     ipv4.method manual \
     ipv4.addresses "192.168.68.100/24" \
     ipv4.never-default yes \
@@ -45,7 +47,7 @@ nmcli connection add type ethernet con-name "dongle-local" \
     connection.autoconnect-priority 100 2>/dev/null
 
 log "Profile 'dongle-local' created:"
-log "  Interface:  enx* (any USB ethernet)"
+log "  Match:      driver=rndis_host (RNDIS dongles only, not real ethernet)"
 log "  IP:         192.168.68.100/24 (static, no DHCP)"
 log "  DNS:        none (host DNS untouched)"
 log "  Route:      never-default (host internet untouched)"
