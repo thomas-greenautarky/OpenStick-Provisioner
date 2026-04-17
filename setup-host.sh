@@ -189,16 +189,6 @@ for cmd in adb fastboot sgdisk sshpass curl psql mcopy; do
     fi
 done
 
-# edl is a special case — comes from pipx, not apt
-EDL_USER_HOME="${SUDO_USER:+/home/$SUDO_USER}"
-EDL_USER_HOME="${EDL_USER_HOME:-$HOME}"
-if sudo -u "${SUDO_USER:-$USER}" bash -c 'command -v edl' >/dev/null 2>&1 || \
-   [ -x "$EDL_USER_HOME/.local/bin/edl" ]; then
-    log "  edl: present (pipx)"
-else
-    warn "  edl: NOT FOUND — install via: pipx install edlclient (as your user, not root)"
-fi
-
 if [ ${#MISSING_APT[@]} -gt 0 ]; then
     echo ""
     warn "Missing apt packages: ${MISSING_APT[*]}"
@@ -209,6 +199,37 @@ if [ ${#MISSING_APT[@]} -gt 0 ]; then
     else
         warn "  Skipping. Install later with:"
         warn "    sudo apt install ${MISSING_APT[*]}"
+    fi
+fi
+
+# edl is a special case — comes from pipx, must be installed as the non-root
+# user so it lands in ~/.local/share/pipx/venvs/, not in root's home.
+# Note: edlclient was REMOVED from PyPI, so we install from the upstream git
+# repo (which is also what flash-uz801.sh's loader-path resolution expects).
+ORIG_USER="${SUDO_USER:-$USER}"
+ORIG_HOME=$(getent passwd "$ORIG_USER" | cut -d: -f6)
+
+if sudo -u "$ORIG_USER" -i bash -c 'command -v edl' >/dev/null 2>&1 \
+   || [ -x "$ORIG_HOME/.local/bin/edl" ]; then
+    log "  edl: present (pipx) for user $ORIG_USER"
+else
+    warn "  edl: NOT FOUND"
+    if ! sudo -u "$ORIG_USER" -i bash -c 'command -v pipx' >/dev/null 2>&1; then
+        log "  Installing pipx (required for edl)..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y pipx
+        sudo -u "$ORIG_USER" -i bash -c 'pipx ensurepath' >/dev/null 2>&1 || true
+    fi
+    if confirm "Install edl now via 'pipx install git+https://github.com/bkerler/edl.git' as user $ORIG_USER?"; then
+        log "  Installing edl from upstream git (this can take 2-5 min)..."
+        if sudo -u "$ORIG_USER" -i bash -c 'pipx install git+https://github.com/bkerler/edl.git'; then
+            log "  edl installed successfully."
+        else
+            warn "  edl install failed. Install manually:"
+            warn "    pipx install git+https://github.com/bkerler/edl.git"
+        fi
+    else
+        warn "  Skipping edl install. Install manually as user $ORIG_USER:"
+        warn "    pipx install git+https://github.com/bkerler/edl.git"
     fi
 fi
 

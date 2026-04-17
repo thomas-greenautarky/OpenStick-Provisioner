@@ -56,7 +56,7 @@ sudo bash setup-host.sh --yes        # non-interactive — accept all installs
 | `/etc/NetworkManager/conf.d/99-only-rndis.conf` | Strict NM config (rndis-only) | Yes — delete + restart NM |
 | `/etc/NetworkManager/system-connections/dongle-local.nmconnection` | Dongle profile | Yes — `nmcli connection delete dongle-local` |
 | apt packages (network-manager, adb, fastboot, gdisk, sshpass, postgresql-client, mtools) | Standard Debian packages | Yes — apt remove |
-| `pipx install edlclient` | Runs as your user, not root | Yes — `pipx uninstall edlclient` |
+| `pipx install git+https://github.com/bkerler/edl.git` | Runs as your user, not root | Yes — `pipx uninstall edlclient` |
 
 Nothing in `/etc/network/interfaces`, `/etc/systemd/network/`, or
 `/etc/dhcpcd.conf` is modified.
@@ -158,11 +158,11 @@ No rebuild needed — the OpenStick repo ships the reference modem firmware
 - Works alongside **dhcpcd** — NM doesn't touch interfaces dhcpcd manages.
 - Works alongside **Tailscale, WireGuard, Docker, VLANs, macvlans** —
   all stay "connected (externally)" in nmcli and untouched.
-- `edl` comes from `pipx install edlclient` — do this **as your normal
+- `edl` comes from `pipx install git+https://github.com/bkerler/edl.git` — do this **as your normal
   user**, not as root. On a headless Pi:
   ```bash
   sudo apt install pipx
   pipx ensurepath
-  pipx install edlclient
+  pipx install git+https://github.com/bkerler/edl.git
   # Log out + back in, or source ~/.bashrc, so 'edl' is in $PATH.
   ```

@@ -458,7 +458,7 @@ The shared secret is in `.env` (never committed).
 |------------|---------|---------|
 | [USB-Dongle-OpenStick](https://github.com/thomas-greenautarky/USB-Dongle-OpenStick) | Clone + build | Base firmware image + flash scripts + test suite |
 | `sshpass` | `apt install sshpass` | SSH automation with password |
-| `edl` | `pipx install edlclient` | Qualcomm EDL flash protocol |
+| `edl` | `pipx install git+https://github.com/bkerler/edl.git` | Qualcomm EDL flash protocol |
 | `psql` | `apt install postgresql-client` | Database writes (optional — provisioning works without) |
 | `openssl` | _(pre-installed)_ | WiFi PSK derivation (HMAC-SHA256) |
 
