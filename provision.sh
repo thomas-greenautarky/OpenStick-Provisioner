@@ -275,6 +275,22 @@ if [ "$AUTOCONNECT_STATE" = "failed" ] || $FIRMWARE_HEALED; then
     sleep 10
 fi
 
+# ─── Step 2c: Install status LED service (cosmetic, safe on any variant) ────
+# Newer rootfs builds ship this by default, but existing dongles provisioned
+# from older images don't. Copy the service + helper from the OpenStick repo
+# if they're missing so the WAN/WLAN indicator LEDs reflect activity
+# regardless of which build the dongle is running.
+
+LED_SERVICE_LOCAL="$OPENSTICK_DIR/build/overlay/etc/systemd/system/led-status.service"
+LED_SCRIPT_LOCAL="$OPENSTICK_DIR/build/overlay/usr/local/bin/led-status.sh"
+LED_SERVICE_PRESENT=$(ssh_cmd "[ -f /etc/systemd/system/led-status.service ] && echo yes || echo no" || echo no)
+if [ "$LED_SERVICE_PRESENT" != "yes" ] && [ -f "$LED_SERVICE_LOCAL" ] && [ -f "$LED_SCRIPT_LOCAL" ]; then
+    log "  Installing LED status service..."
+    SSHPASS="$DONGLE_PASS" sshpass -e scp $SSH_OPTS "$LED_SERVICE_LOCAL" "root@$DONGLE_IP:/etc/systemd/system/led-status.service" 2>/dev/null
+    SSHPASS="$DONGLE_PASS" sshpass -e scp $SSH_OPTS "$LED_SCRIPT_LOCAL"  "root@$DONGLE_IP:/usr/local/bin/led-status.sh"        2>/dev/null
+    ssh_cmd "chmod +x /usr/local/bin/led-status.sh; systemctl daemon-reload; systemctl enable --now led-status.service"
+fi
+
 # ─── Step 3: Read IMEI + derive identifiers ─────────────────────────────────
 
 log "=== Step 3: Device identification ==="
