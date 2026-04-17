@@ -251,6 +251,7 @@ ssh-keygen -f "$HOME/.ssh/known_hosts" -R "$DONGLE_IP" 2>/dev/null || true
 
 REF_FW_DIR="$OPENSTICK_DIR/flash/files/uz801/modem_firmware"
 MODEM_B00_PRESENT=$(ssh_cmd "[ -f /lib/firmware/modem.b00 ] && echo yes || echo no" || echo no)
+FIRMWARE_HEALED=false
 if [ "$MODEM_B00_PRESENT" != "yes" ]; then
     if [ -d "$REF_FW_DIR" ] && [ "$(ls "$REF_FW_DIR" 2>/dev/null | wc -l)" -gt 0 ]; then
         warn "Modem firmware segments missing on dongle — copying reference set ($(ls "$REF_FW_DIR" | wc -l) files)"
@@ -258,9 +259,20 @@ if [ "$MODEM_B00_PRESENT" != "yes" ]; then
         log "  Restarting modem DSP + ModemManager..."
         ssh_cmd "systemctl restart rmtfs 2>/dev/null; echo stop > /sys/class/remoteproc/remoteproc0/state 2>/dev/null; sleep 2; echo start > /sys/class/remoteproc/remoteproc0/state 2>/dev/null; sleep 3; systemctl restart ModemManager"
         sleep 15
+        FIRMWARE_HEALED=true
     else
         warn "Modem firmware missing and no reference set at $REF_FW_DIR — LTE will not work"
     fi
+fi
+
+# If modem-autoconnect is in failed state (common after firmware heal, or after
+# a boot where firmware wasn't ready on time), restart it. systemd won't
+# auto-retry failed oneshot services.
+AUTOCONNECT_STATE=$(ssh_cmd "systemctl is-failed modem-autoconnect 2>/dev/null" || echo unknown)
+if [ "$AUTOCONNECT_STATE" = "failed" ] || $FIRMWARE_HEALED; then
+    log "  Restarting modem-autoconnect (establishing LTE bearer)..."
+    ssh_cmd "systemctl reset-failed modem-autoconnect 2>/dev/null; systemctl restart modem-autoconnect"
+    sleep 10
 fi
 
 # ─── Step 3: Read IMEI + derive identifiers ─────────────────────────────────
