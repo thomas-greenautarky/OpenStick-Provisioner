@@ -64,23 +64,38 @@ db_init() {
             netbird_hostname TEXT,
             hostname        TEXT,
             dongle_type     TEXT,
+            hwid            TEXT,
+            msm_id          TEXT,
+            emmc_sectors    BIGINT,
+            dt_model        TEXT,
+            dt_compatible   TEXT,
             provisioned_at  TIMESTAMPTZ DEFAULT NOW()
         );
     " || { warn "Failed to init DB schema"; return 1; }
-    # Add dongle_type to pre-existing deployments (idempotent)
-    db_query "ALTER TABLE ${DB_SCHEMA}.devices ADD COLUMN IF NOT EXISTS dongle_type TEXT;" || true
+    # Add new columns to pre-existing deployments (idempotent)
+    db_query "ALTER TABLE ${DB_SCHEMA}.devices
+        ADD COLUMN IF NOT EXISTS dongle_type   TEXT,
+        ADD COLUMN IF NOT EXISTS hwid          TEXT,
+        ADD COLUMN IF NOT EXISTS msm_id        TEXT,
+        ADD COLUMN IF NOT EXISTS emmc_sectors  BIGINT,
+        ADD COLUMN IF NOT EXISTS dt_model      TEXT,
+        ADD COLUMN IF NOT EXISTS dt_compatible TEXT;" || true
 }
 
 # ─── Record device (UPSERT on imei) ────────────────────────────────────────
 
 db_record_device() {
-    local imei="$1" serial="$2" qr_code="$3" fw_version="$4" phone="$5" nb_ip="$6" nb_hostname="$7" hostname="$8" dongle_type="${9:-unknown}"
+    local imei="$1" serial="$2" qr_code="$3" fw_version="$4" phone="$5" nb_ip="$6" nb_hostname="$7" hostname="$8"
+    local dongle_type="${9:-unknown}"
+    local hwid="${10:-}" msm_id="${11:-}" emmc_sectors="${12:-0}" dt_model="${13:-}" dt_compatible="${14:-}"
 
     db_query "
         INSERT INTO ${DB_SCHEMA}.devices
-            (imei, serial_number, qr_code, firmware_version, phone_number, netbird_ip, netbird_hostname, hostname, dongle_type, provisioned_at)
+            (imei, serial_number, qr_code, firmware_version, phone_number, netbird_ip, netbird_hostname, hostname,
+             dongle_type, hwid, msm_id, emmc_sectors, dt_model, dt_compatible, provisioned_at)
         VALUES
-            ('${imei}', '${serial}', '${qr_code}', '${fw_version}', '${phone}', '${nb_ip}', '${nb_hostname}', '${hostname}', '${dongle_type}', NOW())
+            ('${imei}', '${serial}', '${qr_code}', '${fw_version}', '${phone}', '${nb_ip}', '${nb_hostname}', '${hostname}',
+             '${dongle_type}', '${hwid}', '${msm_id}', NULLIF('${emmc_sectors}','0')::BIGINT, '${dt_model}', '${dt_compatible}', NOW())
         ON CONFLICT (imei) DO UPDATE SET
             serial_number    = EXCLUDED.serial_number,
             qr_code          = EXCLUDED.qr_code,
@@ -90,6 +105,11 @@ db_record_device() {
             netbird_hostname = EXCLUDED.netbird_hostname,
             hostname         = EXCLUDED.hostname,
             dongle_type      = EXCLUDED.dongle_type,
+            hwid             = COALESCE(NULLIF(EXCLUDED.hwid, ''),          ${DB_SCHEMA}.devices.hwid),
+            msm_id           = COALESCE(NULLIF(EXCLUDED.msm_id, ''),        ${DB_SCHEMA}.devices.msm_id),
+            emmc_sectors     = COALESCE(EXCLUDED.emmc_sectors,              ${DB_SCHEMA}.devices.emmc_sectors),
+            dt_model         = COALESCE(NULLIF(EXCLUDED.dt_model, ''),      ${DB_SCHEMA}.devices.dt_model),
+            dt_compatible    = COALESCE(NULLIF(EXCLUDED.dt_compatible, ''), ${DB_SCHEMA}.devices.dt_compatible),
             provisioned_at   = NOW();
     " || { warn "Failed to record device in DB"; return 1; }
 }

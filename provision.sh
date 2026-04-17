@@ -199,9 +199,33 @@ if ! $SKIP_FLASH; then
     [ -f "$FLASH_SCRIPT" ] || err "Flash script not found: $FLASH_SCRIPT"
     log "  Flash script: $(basename $FLASH_SCRIPT)"
 
+    # Pass a probe-file path so flash-uz801.sh writes chipset/emmc info we can record
+    PROBE_FILE=$(mktemp -t openstick-probe-XXXXXX.env)
     cd "$OPENSTICK_DIR/flash"
-    bash "$FLASH_SCRIPT"
+    if [[ "$FLASH_SCRIPT" == *flash-uz801.sh ]]; then
+        bash "$FLASH_SCRIPT" --probe-file "$PROBE_FILE"
+    else
+        bash "$FLASH_SCRIPT"
+    fi
     cd "$SCRIPT_DIR"
+
+    # Load probe info into environment for later DB record
+    if [ -f "$PROBE_FILE" ] && [ -s "$PROBE_FILE" ]; then
+        log "  Probe info:"
+        while IFS='=' read -r key value; do
+            [ -z "$key" ] && continue
+            case "$key" in
+                hwid)         DONGLE_HWID="$value" ;;
+                msm_id)       DONGLE_MSM_ID="$value" ;;
+                pk_hash)      DONGLE_PK_HASH="$value" ;;
+                memory)       DONGLE_MEMORY="$value" ;;
+                emmc_sectors) DONGLE_EMMC_SECTORS="$value" ;;
+                emmc_size_mb) DONGLE_EMMC_SIZE_MB="$value" ;;
+            esac
+            log "    $key=$value"
+        done < "$PROBE_FILE"
+        rm -f "$PROBE_FILE"
+    fi
 fi
 
 # ─── Step 2: Wait for SSH ────────────────────────────────────────────────────
@@ -289,6 +313,8 @@ fi
 # Determine dongle type — prefer device-tree model (authoritative after boot),
 # otherwise keep what Step 1 detected via USB ID.
 DT_MODEL=$(ssh_cmd "cat /sys/firmware/devicetree/base/model 2>/dev/null | tr -d '\0'" || true)
+DT_COMPATIBLE=$(ssh_cmd "cat /sys/firmware/devicetree/base/compatible 2>/dev/null | tr '\0' ','" || true)
+DT_COMPATIBLE="${DT_COMPATIBLE%,}"
 case "$DT_MODEL" in
     *UZ801*|*uz801*|*Yiming*)  DONGLE_TYPE="UZ801" ;;
     *JZ0145*|*jz01-45*)        DONGLE_TYPE="JZ0145-v33" ;;
@@ -302,6 +328,8 @@ PHONE_NUMBER=$(ssh_cmd "mmcli -m 0 -K 2>/dev/null | grep 'modem.generic.own-numb
 log "  IMEI:     $IMEI"
 log "  Serial:   ${SERIAL_NUMBER:-unknown}"
 log "  Type:     $DONGLE_TYPE${DT_MODEL:+ ($DT_MODEL)}"
+log "  HWID:     ${DONGLE_HWID:-unknown}"
+log "  eMMC:     ${DONGLE_EMMC_SIZE_MB:-?} MB (${DONGLE_EMMC_SECTORS:-?} sectors)"
 log "  Phone:    ${PHONE_NUMBER:-unknown}"
 log "  Hostname: $HOSTNAME"
 log "  WiFi:     $SSID / $PSK"
@@ -412,7 +440,9 @@ else
         if db_load_config; then
             db_init && \
             db_record_device "$IMEI" "${SERIAL_NUMBER:-}" "$QR_CODE" "$FIRMWARE_VERSION" \
-                "${PHONE_NUMBER:-}" "${NB_IP:-}" "$HOSTNAME" "$HOSTNAME" "$DONGLE_TYPE" && \
+                "${PHONE_NUMBER:-}" "${NB_IP:-}" "$HOSTNAME" "$HOSTNAME" "$DONGLE_TYPE" \
+                "${DONGLE_HWID:-}" "${DONGLE_MSM_ID:-}" "${DONGLE_EMMC_SECTORS:-0}" \
+                "${DT_MODEL:-}" "${DT_COMPATIBLE:-}" && \
                 DB_STATUS="recorded" || DB_STATUS="failed"
         else
             DB_STATUS="no config"
