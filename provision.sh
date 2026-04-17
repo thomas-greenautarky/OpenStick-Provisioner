@@ -143,20 +143,24 @@ if ! $SKIP_FLASH; then
         # Stock Android dongle (UZ801 type) — use lk2nd-based flash
         log "  Detected: UZ801 (Stock Android)"
         FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-uz801.sh"
+        DONGLE_TYPE="UZ801"
         [ -f "$FLASH_SCRIPT" ] || err "flash-uz801.sh not found at $FLASH_SCRIPT"
     elif lsusb 2>/dev/null | grep -q "05c6:9008"; then
         # EDL mode — could be either type. Check if uz801 files exist.
         if [ -f "$OPENSTICK_DIR/flash/files/uz801/aboot.mbn" ]; then
             log "  Detected: EDL mode (using UZ801 flash with lk2nd)"
             FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-uz801.sh"
+            DONGLE_TYPE="UZ801"
         else
             log "  Detected: EDL mode (using JZ0145-v33 flash)"
             FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-openstick.sh"
+            DONGLE_TYPE="JZ0145-v33"
         fi
     elif lsusb 2>/dev/null | grep -q "18d1:d00d"; then
         # Fastboot/lk2nd — already has lk2nd, use uz801 flash
         log "  Detected: Fastboot/lk2nd"
         FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-uz801.sh"
+        DONGLE_TYPE="UZ801"
     else
         # No dongle detected — wait for one
         warn "No dongle detected. Please plug in a dongle now."
@@ -168,18 +172,22 @@ if ! $SKIP_FLASH; then
             if lsusb 2>/dev/null | grep -q "05c6:f00e\|05c6:90b6"; then
                 echo " UZ801 detected!"
                 FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-uz801.sh"
+                DONGLE_TYPE="UZ801"
                 break
             elif lsusb 2>/dev/null | grep -q "05c6:9008"; then
                 echo " EDL detected!"
                 if [ -f "$OPENSTICK_DIR/flash/files/uz801/aboot.mbn" ]; then
                     FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-uz801.sh"
+                    DONGLE_TYPE="UZ801"
                 else
                     FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-openstick.sh"
+                    DONGLE_TYPE="JZ0145-v33"
                 fi
                 break
             elif lsusb 2>/dev/null | grep -q "18d1:d00d"; then
                 echo " Fastboot/lk2nd detected!"
                 FLASH_SCRIPT="$OPENSTICK_DIR/flash/flash-uz801.sh"
+                DONGLE_TYPE="UZ801"
                 break
             fi
             echo -n "."
@@ -278,12 +286,22 @@ if [ -z "$SERIAL_NUMBER" ]; then
     SERIAL_NUMBER=$(ssh_cmd "cat /sys/block/mmcblk0/device/cid 2>/dev/null | tr -d '\0'" || true)
 fi
 
+# Determine dongle type — prefer device-tree model (authoritative after boot),
+# otherwise keep what Step 1 detected via USB ID.
+DT_MODEL=$(ssh_cmd "cat /sys/firmware/devicetree/base/model 2>/dev/null | tr -d '\0'" || true)
+case "$DT_MODEL" in
+    *UZ801*|*uz801*|*Yiming*)  DONGLE_TYPE="UZ801" ;;
+    *JZ0145*|*jz01-45*)        DONGLE_TYPE="JZ0145-v33" ;;
+esac
+DONGLE_TYPE="${DONGLE_TYPE:-unknown}"
+
 # Read SIM phone number
 PHONE_NUMBER=$(ssh_cmd "mmcli -m 0 -K 2>/dev/null | grep 'modem.generic.own-numbers.value' | awk -F': ' '{print \$2}' | xargs" || true)
 [ -z "$PHONE_NUMBER" ] || [ "$PHONE_NUMBER" = "--" ] && PHONE_NUMBER=""
 
 log "  IMEI:     $IMEI"
 log "  Serial:   ${SERIAL_NUMBER:-unknown}"
+log "  Type:     $DONGLE_TYPE${DT_MODEL:+ ($DT_MODEL)}"
 log "  Phone:    ${PHONE_NUMBER:-unknown}"
 log "  Hostname: $HOSTNAME"
 log "  WiFi:     $SSID / $PSK"
@@ -394,7 +412,7 @@ else
         if db_load_config; then
             db_init && \
             db_record_device "$IMEI" "${SERIAL_NUMBER:-}" "$QR_CODE" "$FIRMWARE_VERSION" \
-                "${PHONE_NUMBER:-}" "${NB_IP:-}" "$HOSTNAME" "$HOSTNAME" && \
+                "${PHONE_NUMBER:-}" "${NB_IP:-}" "$HOSTNAME" "$HOSTNAME" "$DONGLE_TYPE" && \
                 DB_STATUS="recorded" || DB_STATUS="failed"
         else
             DB_STATUS="no config"
@@ -416,6 +434,7 @@ echo ""
 log "═══════════════════════════════════════"
 log "  Provisioning complete!"
 log "  Device:    $HOSTNAME ($IMEI)"
+log "  Type:      $DONGLE_TYPE"
 log "  Serial:    ${SERIAL_NUMBER:-unknown}"
 log "  QR Code:   $QR_CODE"
 log "  Phone:     ${PHONE_NUMBER:-unknown}"
