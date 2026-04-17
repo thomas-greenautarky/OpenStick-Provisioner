@@ -11,35 +11,94 @@ each successfully provisioned dongle to the database.
 
 ## Quick Start
 
+Both repos are expected to live side-by-side (the paths are relative, so any
+parent directory works — the examples use `~/git/`):
+
+```
+~/git/
+├── USB-Dongle-OpenStick/       # flash scripts, rootfs build, overlay, reference firmware
+└── OpenStick-Provisioner/      # provisioner (this repo), DB, .env, provision.sh
+```
+
 ```bash
 # 1. Clone both repos
+mkdir -p ~/git && cd ~/git
 git clone https://github.com/thomas-greenautarky/USB-Dongle-OpenStick.git
 git clone https://github.com/thomas-greenautarky/OpenStick-Provisioner.git
 
-# 2. Build the base image (once)
-cd USB-Dongle-OpenStick
+# 2. Set up host (one-time per provisioning machine)
+cd ~/git/OpenStick-Provisioner
+sudo bash setup-host.sh
+# Creates NetworkManager profile 'dongle-local' that matches by driver
+# (rndis_host) so flashed dongles can't hijack the host's internet.
+# Also checks all required tools (edl, adb, fastboot, sgdisk, sshpass, curl,
+# psql, mtools) and tells you what to install if anything is missing.
+
+# 3. Configure secrets + database
+cp .env.example .env
+cp database.conf.example database.conf
+# Edit .env       — OPENSTICK_WIFI_SECRET, NETBIRD_SETUP_KEY, ROOT_PASSWORD
+# Edit database.conf — PostgreSQL connection (host, dbname, user, password)
+
+# 4. (Optional) Rebuild rootfs — only needed when changing the base image
+cd ~/git/USB-Dongle-OpenStick
 docker build -t openstick-builder build/
 docker run --rm --privileged -v $(pwd)/build/output:/output -v $(pwd)/build:/build openstick-builder
 
-# 3. Set up secrets + database config
-cd ../OpenStick-Provisioner
-cp .env.example .env
-cp database.conf.example database.conf
-# Edit .env and database.conf with real values
-
-# 4. Install dependencies
-sudo apt install sshpass postgresql-client
-pipx install edlclient
-
-# 5. Set up route protection (once per provisioning machine)
-nmcli connection add type ethernet con-name "dongle-no-route" \
-    match.interface-name "enx*" ipv4.never-default yes ipv4.dns-priority 200 \
-    ipv6.method disabled connection.autoconnect yes connection.autoconnect-priority 100
-
-# 6. Flash + provision a dongle
-#    - Enter EDL: hold reset button while plugging in USB
-bash provision.sh
+# 5. Provision a dongle: plug it in, scan QR, done
+cd ~/git/OpenStick-Provisioner
+bash provision.sh --qr-code SIM-WIN-00000042
 ```
+
+### Updating (routine)
+
+```bash
+cd ~/git/USB-Dongle-OpenStick     && git pull
+cd ~/git/OpenStick-Provisioner    && git pull
+```
+
+The OpenStick repo ships the reference modem firmware (~50 MB bundled in
+`flash/files/uz801/modem_firmware/`), so `git pull` is all you need — no
+separate firmware download.
+
+### Works on
+
+- **Laptop** (Debian/Ubuntu) — primary development environment
+- **Raspberry Pi** (Pi OS bookworm) — deployment target. The scripts are
+  Python-version-agnostic (pipx venv path detected via glob) and the host
+  setup script detects the platform automatically.
+
+## What runs automatically (no flags, no prompts)
+
+The pipeline is designed to recover from every known quirk without user
+intervention. For a full reasoning/history see
+[`../USB-Dongle-OpenStick/docs/dongle-compatibility.md`](https://github.com/thomas-greenautarky/USB-Dongle-OpenStick/blob/main/docs/dongle-compatibility.md)
+and [`variant-strategy.md`](https://github.com/thomas-greenautarky/USB-Dongle-OpenStick/blob/main/docs/variant-strategy.md).
+
+| Automation | What it does |
+|---|---|
+| **Pre-flash probe** | Reads HWID, MSM_ID, eMMC sectors from Sahara; written to DB for fleet reporting |
+| **Qualcomm factory loader (default)** | Avoids USB Overflow on 014-class dongles without `--loader` flag |
+| **`--memory=emmc` everywhere** | Prevents Firehose MaxPayload mis-negotiation |
+| **Skip-stock-backup by default** | Avoids USB state corruption from the 64 MB modem read; NV backup (5 reads) still runs |
+| **Reference modem firmware fallback** | `flash/files/uz801/modem_firmware/` copied to rootfs if ADB backup unavailable (EDL-only flashes) |
+| **Auto-heal `/lib/firmware/modem.b00`** | After SSH up, `provision.sh` checks + copies reference firmware if missing, then restarts rmtfs + remoteproc + ModemManager |
+| **Modem-autoconnect reset-failed** | If the oneshot service failed at boot (firmware wasn't ready), re-trigger it post-heal |
+| **LED service auto-install** | Variant-agnostic `led-status.service` installed via SSH if absent |
+| **Auto-detect replug** | If a Sahara error demands power cycle, poll lsusb for disconnect + reconnect instead of waiting for Enter |
+| **DT-model based type detection** | Post-boot type is read from `/sys/firmware/devicetree/base/model` — authoritative even when USB-ID heuristics fail |
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `USBError(75, 'Overflow')` on first write | longcheer loader + unlucky USB endpoint | Should not happen with default qualcomm factory loader. If it does, try a different loader: `EDL_LOADER=<path> bash provision.sh …` |
+| Red LED always on, blue/green off | LED triggers never configured | Reinstalled automatically on next `provision.sh` run. Manual: `systemctl restart led-status.service` |
+| Modem `DeviceNotReady`, signal 0 | `/lib/firmware/modem.b00+` missing | Auto-healed on next `provision.sh --skip-flash` run. Manual: re-copy from `~/git/USB-Dongle-OpenStick/flash/files/uz801/modem_firmware/`, then restart rmtfs+remoteproc+ModemManager |
+| Modem registered but no LTE bearer | `modem-autoconnect` stuck in `failed` | Auto-handled by `provision.sh`. Manual: `ssh root@dongle 'systemctl reset-failed modem-autoconnect; systemctl restart modem-autoconnect'` |
+| Dongle enumerates only as EDL (`05c6:9008`) | Boot chain broken (failed flash, PBL fallback) | Re-run `provision.sh` — flash-uz801.sh accepts EDL-state dongles and re-flashes |
+| Dongle doesn't enumerate at all | Hardware-level brick (sbl1 corrupted) | Needs D+/GND short on USB cable or PCB testpoint — no software recovery possible |
+| Host internet drops when dongle boots | Old `enx*`-matching NM profile | Run `sudo bash setup-host.sh` — creates the correct `match.driver=rndis_host` profile |
 
 ## Usage
 
@@ -223,9 +282,20 @@ This file is gitignored. See `database.conf.example` for a template.
 | `netbird_ip` | `TEXT` | NetBird VPN IP address |
 | `netbird_hostname` | `TEXT` | NetBird peer name (= dongle hostname) |
 | `hostname` | `TEXT` | Dongle hostname (e.g. `ga-3112`) |
+| `dongle_type` | `TEXT` | `UZ801`, `JZ0145-v33`, or `unknown` |
+| `hwid` | `TEXT` | Full Qualcomm HWID (e.g. `0x007050e100000000`) |
+| `msm_id` | `TEXT` | Chip family ID (e.g. `0x007050e1` = MSM8916/APQ8016) |
+| `emmc_sectors` | `BIGINT` | eMMC size in 512-byte sectors |
+| `dt_model` | `TEXT` | Device-tree model string (`uz801 v3.0 4G Modem Stick`, etc.) |
+| `dt_compatible` | `TEXT` | Device-tree compatible string(s) |
 | `provisioned_at` | `TIMESTAMPTZ` | Timestamp of successful provisioning |
 
 Re-provisioning the same dongle (same IMEI) updates the existing row (UPSERT).
+Chipset fields (HWID, MSM_ID, eMMC sectors) are captured during the pre-flash
+EDL probe; DT fields are read from the running Debian post-boot.
+
+The schema auto-migrates — older deployments are extended with
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` on every run.
 
 ### Querying the Database
 
