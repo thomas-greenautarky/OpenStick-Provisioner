@@ -243,6 +243,26 @@ ssh_cmd "echo OK" | grep -q OK || err "SSH not reachable after 120s"
 # Remove old host key
 ssh-keygen -f "$HOME/.ssh/known_hosts" -R "$DONGLE_IP" 2>/dev/null || true
 
+# ─── Step 2b: Ensure modem firmware is present (auto-heals EDL-only flashes) ─
+# On fresh boots the rootfs only ships .mdt metadata files — the actual .b00+
+# segments must come from the device's own stock Android (copied via ADB/scp
+# during flash). For dongles flashed in EDL-only mode (e.g. no Stock Android
+# access), copy from a reference set so LTE works automatically.
+
+REF_FW_DIR="$OPENSTICK_DIR/flash/files/uz801/modem_firmware"
+MODEM_B00_PRESENT=$(ssh_cmd "[ -f /lib/firmware/modem.b00 ] && echo yes || echo no" || echo no)
+if [ "$MODEM_B00_PRESENT" != "yes" ]; then
+    if [ -d "$REF_FW_DIR" ] && [ "$(ls "$REF_FW_DIR" 2>/dev/null | wc -l)" -gt 0 ]; then
+        warn "Modem firmware segments missing on dongle — copying reference set ($(ls "$REF_FW_DIR" | wc -l) files)"
+        SSHPASS="$DONGLE_PASS" sshpass -e scp $SSH_OPTS -r "$REF_FW_DIR"/* "root@$DONGLE_IP:/lib/firmware/" 2>&1 | tail -3 || warn "scp firmware had errors (some files expected to skip)"
+        log "  Restarting modem DSP + ModemManager..."
+        ssh_cmd "systemctl restart rmtfs 2>/dev/null; echo stop > /sys/class/remoteproc/remoteproc0/state 2>/dev/null; sleep 2; echo start > /sys/class/remoteproc/remoteproc0/state 2>/dev/null; sleep 3; systemctl restart ModemManager"
+        sleep 15
+    else
+        warn "Modem firmware missing and no reference set at $REF_FW_DIR — LTE will not work"
+    fi
+fi
+
 # ─── Step 3: Read IMEI + derive identifiers ─────────────────────────────────
 
 log "=== Step 3: Device identification ==="
