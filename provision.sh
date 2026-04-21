@@ -53,6 +53,37 @@ which sshpass >/dev/null 2>&1 || err "sshpass not installed (apt install sshpass
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
 ssh_cmd() { SSHPASS="$DONGLE_PASS" sshpass -e ssh $SSH_OPTS "$DONGLE_USER@$DONGLE_IP" "$1" 2>/dev/null; }
+
+# run_with_tick LABEL -- CMD [ARGS...]
+#
+# Runs CMD and emits a single-line heartbeat every 10s after the first 5s
+# so the operator can tell whether a silent long-running step is making
+# progress or is stuck. The tick prints elapsed wall-clock time.
+# Returns CMD's exit code untouched.
+#
+# Typical silent phases: `netbird up` (can take 10-60s while it retries
+# Management + Signal), mmcli `--simple-connect` (2-10s), SSH-over-LTE
+# copies, etc. Without a tick, these phases look indistinguishable from
+# a deadlocked daemon.
+run_with_tick() {
+    local label="$1"; shift
+    [ "$1" = "--" ] && shift
+    local start=$SECONDS
+    "$@" &
+    local pid=$!
+    (
+        sleep 5
+        while kill -0 "$pid" 2>/dev/null; do
+            sleep 5
+            kill -0 "$pid" 2>/dev/null && \
+                printf '  [%s] still working... %ds elapsed\n' "$label" "$((SECONDS - start))"
+        done
+    ) &
+    local tick_pid=$!
+    wait "$pid"; local rc=$?
+    kill "$tick_pid" 2>/dev/null; wait "$tick_pid" 2>/dev/null || true
+    return "$rc"
+}
 # ssh_bash: pipe a local script to the dongle via stdin (no escape-hell for
 # multi-line remote snippets). Arguments after the function name become $1..
 # inside the script.
@@ -378,10 +409,19 @@ fi
 # If modem-autoconnect is in failed state (common after firmware heal, or after
 # a boot where firmware wasn't ready on time), restart it. systemd won't
 # auto-retry failed oneshot services.
+#
+# Note: on a freshly-flashed dongle this restart will typically FAIL AGAIN
+# because the rootfs ships with APN=internet (build default) while the real
+# APN (from provision.conf) hasn't been written to /etc/default/lte-apn yet
+# — Step 4 does that. On Vodafone IoT SIMs that triggers
+# "ServiceOptionNotSubscribed" from the carrier. We accept this failure
+# here (|| true) because the real, successful restart happens later in
+# Step 4 after the APN is in place, and ensure_lte_data_up() does the
+# final bring-up directly via mmcli.
 AUTOCONNECT_STATE=$(ssh_cmd "systemctl is-failed modem-autoconnect 2>/dev/null" || echo unknown)
 if [ "$AUTOCONNECT_STATE" = "failed" ] || $FIRMWARE_HEALED; then
-    log "  Restarting modem-autoconnect (establishing LTE bearer)..."
-    ssh_cmd "systemctl reset-failed modem-autoconnect 2>/dev/null; systemctl restart modem-autoconnect"
+    log "  Restarting modem-autoconnect (may fail on first boot if APN not yet applied — that's fine, Step 4 retries)"
+    ssh_cmd "systemctl reset-failed modem-autoconnect 2>/dev/null; systemctl restart modem-autoconnect 2>/dev/null" || true
     sleep 10
 fi
 
@@ -684,9 +724,11 @@ elif [ -n "$NETBIRD_SETUP_KEY" ] && [ "$NETBIRD_SETUP_KEY" != "nb-XXXXXXXX-XXXX-
         # (clock-sync.service, modem-autoconnect.service) on subsequent
         # boots, but on first boot they can lose the race with this step.
         sync_dongle_time
-        ensure_lte_data_up "$APN"
-        ssh_cmd "systemctl stop netbird 2>/dev/null; rm -rf /var/lib/netbird/* /etc/netbird.conf /etc/netbird/*.conf 2>/dev/null; systemctl start netbird 2>/dev/null; sleep 2"
-        ssh_cmd "netbird up --setup-key '$NETBIRD_SETUP_KEY' --hostname '$QR_CODE'" 2>/dev/null
+        run_with_tick "LTE bring-up" -- ensure_lte_data_up "$APN"
+        run_with_tick "netbird reset" -- \
+            ssh_cmd "systemctl stop netbird 2>/dev/null; rm -rf /var/lib/netbird/* /etc/netbird.conf /etc/netbird/*.conf 2>/dev/null; systemctl start netbird 2>/dev/null; sleep 2"
+        run_with_tick "netbird up" -- \
+            ssh_cmd "netbird up --setup-key '$NETBIRD_SETUP_KEY' --hostname '$QR_CODE'" 2>/dev/null
         # Capture both the peer IP and the NetBird FQDN. The FQDN is the
         # real cloud-side identifier (e.g. `ga-3112-109-63.netbird.cloud`)
         # — distinct from the dongle's local hostname (e.g. `ga-6892`).
