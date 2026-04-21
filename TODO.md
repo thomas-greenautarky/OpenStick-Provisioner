@@ -25,16 +25,25 @@ test-provision.sh, db.sh, setup-host.sh). Rootfs-side TODOs live in
 
 ## ACL / carrier-side
 
-- [ ] Verify the 5 invisible entries in the Vodafone IoT
-      `EP_GreenAutarky_ACL` (15 total, only 10 shown in the UI snippet)
-      include:
-      - NTP: `time.google.com` or `pool.ntp.org` (🔴 critical — without
-        NTP, clock drifts and TLS breaks fleet-wide after weeks)
-      - Debian updates: `deb.debian.org`, `security.debian.org`
-      - NetBird auth: `login.netbird.io` if not covered by the
-        `api.netbird.io` entry
-      - Backend root: plain `greenautarky.com` (wildcard matches only
-        subdomains; root FQDN failed DNS lookup from the dongle)
+- [x] Vodafone IoT `EP_GreenAutarky_ACL` audit (15 entries):
+      - ✅ NTP: `time.cloudflare.com` IS in the ACL
+      - ✅ Tailscale auth: `login.tailscale.com` IS in the ACL
+      - ✅ NetBird stack complete: `api.netbird.io`, `*.relay.netbird.io`,
+        `signal.netbird.io`
+      - ✅ Tailscale stack complete: `controlplane.tailscale.com`,
+        `*.derp.tailscale.com`, `login.tailscale.com`, `log.tailscale.com`
+      - ✅ Backend: `*.greenautarky.com` (root `greenautarky.com` not in
+        list — only matters if direct root-FQDN access is needed)
+      - ⚪ Not critical, not in ACL: `deb.debian.org`, `security.debian.org`
+        (needed only if `apt upgrade` is run on dongles), `pkgs.tailscale.com`,
+        OCSP/CRL (`*.pki.goog`, `*.letsencrypt.org`)
+      Bottom line: ACL is sufficient for NetBird (setup-key flow) + Tailscale
+      + container workloads + backend access. No blockers.
+
+- [ ] Point the rootfs `clock-sync.service` at `time.cloudflare.com` (now
+      that we know it's whitelisted). Once that works reliably on first
+      boot, the Provisioner's `sync_dongle_time` bandaid can be removed.
+      See `USB-Dongle-OpenStick/TODO.md`.
 
 - [ ] For full Tailscale + Funnel functionality on dongles, the ACL needs:
       - `controlplane.tailscale.com` ✓ (already present)
