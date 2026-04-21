@@ -11,7 +11,8 @@
 #      `unmanaged-devices=except:driver:rndis_host` config, so on first
 #      start NM only touches USB dongle interfaces — everything else
 #      (eth0, VLANs, macvlans, tailscale, wireguard, docker, etc.) is
-#      left alone.
+#      left alone. SKIPPED on hosts where NM already manages a WiFi or
+#      Ethernet interface (laptops), as that config would disconnect it.
 #   3. Creates the "dongle-local" NetworkManager profile (DHCP, no default
 #      route, no DNS, no IPv6) so flashed dongles can never hijack the
 #      host's internet.
@@ -35,6 +36,22 @@ NC='\033[0m'
 log()  { echo -e "${GREEN}[+]${NC} $1"; }
 warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 err()  { echo -e "${RED}[x]${NC} $1"; exit 1; }
+
+# Is there a primary connectivity interface (wifi or ethernet) currently
+# managed by NetworkManager? If yes, writing
+# `unmanaged-devices=except:driver:rndis_host` would disconnect it — this
+# is what kills a laptop's WiFi. On dedicated provisioning hosts (Pi with
+# ifupdown/dhcpcd) there is no such managed interface, so the strict config
+# is safe there.
+has_managed_primary_if() {
+    command -v nmcli >/dev/null 2>&1 || return 1
+    nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | awk -F: '
+        $2 ~ /^(wifi|ethernet)$/ &&
+        $3 ~ /^(connected|activated)/ &&
+        $1 !~ /^(docker|veth|br-|virbr)/ { found=1 }
+        END { exit !found }
+    '
+}
 
 ASSUME_YES=false
 [ "${1:-}" = "--yes" ] && ASSUME_YES=true
@@ -87,15 +104,27 @@ if [ "$has_nm" = "no" ]; then
     # Write the strict config BEFORE installing so NM picks it up on first start.
     # This is critical on hosts with complex ifupdown/tailscale/docker setups —
     # without it, NM would try to manage everything and likely disrupt routing.
-    mkdir -p /etc/NetworkManager/conf.d
-    cat > /etc/NetworkManager/conf.d/99-only-rndis.conf <<'EOF'
+    #
+    # Safety: if a WiFi/Ethernet interface is already actively managed
+    # (laptop with working WiFi, etc.), this config would disconnect it.
+    # In that case we skip the strict config — the dongle-local profile
+    # (Step 3) already prevents route hijacking via ipv4.never-default.
+    if has_managed_primary_if; then
+        warn "  A WiFi/Ethernet interface is currently actively managed."
+        warn "  SKIPPING unmanaged-devices=except:driver:rndis_host — it would"
+        warn "  disconnect that interface. Route hijacking is still prevented"
+        warn "  by the dongle-local profile (ipv4.never-default, no DNS)."
+    else
+        mkdir -p /etc/NetworkManager/conf.d
+        cat > /etc/NetworkManager/conf.d/99-only-rndis.conf <<'EOF'
 [keyfile]
 # Leave everything alone except RNDIS USB gadgets (our flashed dongles).
 # Installed by OpenStick-Provisioner setup-host.sh to keep NetworkManager
 # from disturbing existing eth0/VLAN/macvlan/tailscale/docker/etc. setups.
 unmanaged-devices=except:driver:rndis_host
 EOF
-    log "  Wrote /etc/NetworkManager/conf.d/99-only-rndis.conf"
+        log "  Wrote /etc/NetworkManager/conf.d/99-only-rndis.conf"
+    fi
 
     log "  Installing network-manager package..."
     apt-get update -qq
@@ -121,11 +150,20 @@ EOF
 else
     log "=== Step 2: NetworkManager already installed (skipping install) ==="
     # Still ensure the strict config exists if we didn't install NM ourselves —
-    # skip if admin clearly configured NM for broader use already.
-    if [ ! -f /etc/NetworkManager/conf.d/99-only-rndis.conf ] \
-       && [ "$ifupdown_active" = "active" -o "$dhcpcd_active" = "active" ]; then
-        warn "Detected co-existing ifupdown/dhcpcd — installing the strict"
-        warn "NM-only-rndis config so we don't fight them."
+    # BUT ONLY if NM isn't currently managing a primary interface. On laptops
+    # where NM manages the WiFi, this config would kill connectivity.
+    if [ -f /etc/NetworkManager/conf.d/99-only-rndis.conf ] && has_managed_primary_if; then
+        warn "Existing /etc/NetworkManager/conf.d/99-only-rndis.conf found,"
+        warn "but NM currently manages a WiFi/Ethernet interface. That config"
+        warn "would disconnect it. Consider removing it:"
+        warn "  sudo rm /etc/NetworkManager/conf.d/99-only-rndis.conf"
+        warn "  sudo systemctl restart NetworkManager"
+        warn "Route hijacking is still prevented by the dongle-local profile."
+    elif [ ! -f /etc/NetworkManager/conf.d/99-only-rndis.conf ] \
+         && [ "$ifupdown_active" = "active" -o "$dhcpcd_active" = "active" ] \
+         && ! has_managed_primary_if; then
+        warn "Detected co-existing ifupdown/dhcpcd and no NM-managed primary"
+        warn "interface — installing the strict NM-only-rndis config."
         mkdir -p /etc/NetworkManager/conf.d
         cat > /etc/NetworkManager/conf.d/99-only-rndis.conf <<'EOF'
 [keyfile]
