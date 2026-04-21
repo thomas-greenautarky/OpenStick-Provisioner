@@ -140,6 +140,24 @@ if ip -4 addr show wwan0 2>/dev/null | grep -q 'inet ' \
     exit 0
 fi
 
+# Wait for modem to reach (registered|connected). On a freshly booted
+# dongle the modem can be in `searching` / `enabled` for up to ~90s after
+# the rootfs comes up, especially right after the APN was changed — calling
+# --simple-connect while still `searching` fails hard. We poll every 3s
+# up to 90s total.
+state=""
+for i in $(seq 1 30); do
+    state=$(mmcli -m 0 -K 2>/dev/null | awk -F': +' '/^modem\.generic\.state / {print $2; exit}' | xargs)
+    case "$state" in
+        registered|connected) break ;;
+    esac
+    sleep 3
+done
+case "$state" in
+    registered|connected) ;;
+    *) echo "modem-not-registered:$state"; exit 1 ;;
+esac
+
 # Trigger a simple-connect on modem 0 (creates a 'default' bearer if none
 # yet, or reuses an existing connected one).
 if ! mmcli -m 0 --simple-connect="apn=$apn,ip-type=ipv4" 2>&1 | grep -q "successfully connected"; then
@@ -185,13 +203,31 @@ REMOTE_LTE_UP
     case "$result" in
         already-up)
             log "  LTE data: wwan0 already up"
+            return 0
             ;;
         configured*)
             log "  LTE data: ${result#configured }"
+            return 0
+            ;;
+        modem-not-registered:*)
+            # Distinct return code 2 → caller marks the dongle as "parked",
+            # skips NetBird + tests, writes a parked row to the DB and exits
+            # cleanly. Rationale: no point burning 60s on netbird-up timeouts
+            # and producing a wall of cascade-FAIL output when the root cause
+            # is known — the SIM hasn't registered with the carrier at all.
+            PARKED_DETAIL="modem state after 90s: ${result#modem-not-registered:}"
+            warn "  LTE data: modem never registered (${PARKED_DETAIL})"
+            return 2
+            ;;
+        simple-connect-failed|no-default-bearer)
+            PARKED_DETAIL="$result"
+            warn "  LTE data: $result"
+            return 2
             ;;
         *)
             warn "  LTE data bring-up failed: ${result:-<no output>}"
-            return 1
+            PARKED_DETAIL="${result:-unknown}"
+            return 2
             ;;
     esac
 }
@@ -724,20 +760,34 @@ elif [ -n "$NETBIRD_SETUP_KEY" ] && [ "$NETBIRD_SETUP_KEY" != "nb-XXXXXXXX-XXXX-
         # (clock-sync.service, modem-autoconnect.service) on subsequent
         # boots, but on first boot they can lose the race with this step.
         sync_dongle_time
-        run_with_tick "LTE bring-up" -- ensure_lte_data_up "$APN"
-        run_with_tick "netbird reset" -- \
-            ssh_cmd "systemctl stop netbird 2>/dev/null; rm -rf /var/lib/netbird/* /etc/netbird.conf /etc/netbird/*.conf 2>/dev/null; systemctl start netbird 2>/dev/null; sleep 2"
-        run_with_tick "netbird up" -- \
-            ssh_cmd "netbird up --setup-key '$NETBIRD_SETUP_KEY' --hostname '$QR_CODE'" 2>/dev/null
+        # ensure_lte_data_up returns 2 when the modem fails to register with
+        # the carrier (SIM likely in "Stock" state, needs portal activation).
+        # In that case we skip netbird-up + downstream tests and park the
+        # dongle in the DB — no point waiting on cascading timeouts.
+        PARKED=false
+        PARKED_REASON=""
+        PARKED_DETAIL=""
+        if run_with_tick "LTE bring-up" -- ensure_lte_data_up "$APN"; then
+            run_with_tick "netbird reset" -- \
+                ssh_cmd "systemctl stop netbird 2>/dev/null; rm -rf /var/lib/netbird/* /etc/netbird.conf /etc/netbird/*.conf 2>/dev/null; systemctl start netbird 2>/dev/null; sleep 2"
+            run_with_tick "netbird up" -- \
+                ssh_cmd "netbird up --setup-key '$NETBIRD_SETUP_KEY' --hostname '$QR_CODE'" 2>/dev/null
+        else
+            PARKED=true
+            PARKED_REASON="parked_sim_inactive"
+            warn "  Skipping NetBird enrollment — LTE bring-up failed."
+        fi
         # Capture both the peer IP and the NetBird FQDN. The FQDN is the
         # real cloud-side identifier (e.g. `ga-3112-109-63.netbird.cloud`)
         # — distinct from the dongle's local hostname (e.g. `ga-6892`).
         # Both are recorded in the DB so operators can look a device up
         # by either name and know how to SSH into it remotely.
-        NB_STATUS=$(ssh_cmd "netbird status 2>/dev/null" 2>/dev/null)
-        NB_IP=$(echo   "$NB_STATUS" | awk -F': +' '/NetBird IP/ {print $2; exit}' | awk '{print $1}')
-        NB_FQDN=$(echo "$NB_STATUS" | awk -F': +' '/FQDN/        {print $2; exit}' | awk '{print $1}')
-        log "  NetBird VPN: connected ($NB_IP, $NB_FQDN)"
+        if ! $PARKED; then
+            NB_STATUS=$(ssh_cmd "netbird status 2>/dev/null" 2>/dev/null)
+            NB_IP=$(echo   "$NB_STATUS" | awk -F': +' '/NetBird IP/ {print $2; exit}' | awk '{print $1}')
+            NB_FQDN=$(echo "$NB_STATUS" | awk -F': +' '/FQDN/        {print $2; exit}' | awk '{print $1}')
+            log "  NetBird VPN: connected ($NB_IP, $NB_FQDN)"
+        fi
     else
         warn "  NetBird not installed — rebuild base image"
     fi
@@ -787,6 +837,39 @@ DB_STATUS="skipped"
 if $PREP_MODE; then
     log "=== Step 5: Verify — skipped (prep mode) ==="
     log "=== Step 6: DB — skipped (prep mode) ==="
+elif [ "${PARKED:-false}" = "true" ]; then
+    # Parked dongle — SIM didn't register with carrier, no LTE, no point
+    # running verify tests (they'd all fail on the LTE/NetBird steps
+    # without telling us anything new). Write a parked DB row so fleet
+    # audits show the device with its reason, then exit with a clear
+    # "parked" status. Exit code 2 is distinct from normal failure (1)
+    # so wrapper scripts can distinguish "needs operator action" from
+    # "bug in provisioner".
+    log "=== Step 5/6/7: skipped (dongle parked: $PARKED_REASON) ==="
+    source "$SCRIPT_DIR/db.sh"
+    if db_load_config; then
+        db_init && \
+        db_record_parked "$IMEI" "${SERIAL_NUMBER:-}" "$QR_CODE" "$DONGLE_TYPE" \
+            "${IMSI:-}" "${SIM_OPERATOR:-}" "$PARKED_REASON" "$PARKED_DETAIL" && \
+            DB_STATUS="parked" || DB_STATUS="failed (parked write)"
+    else
+        DB_STATUS="no config"
+    fi
+    echo ""
+    warn "═══════════════════════════════════════"
+    warn "  DONGLE PARKED — provisioning incomplete"
+    warn "  Device:     $HOSTNAME ($IMEI)"
+    warn "  IMSI:       ${IMSI:-unknown}"
+    warn "  Operator:   ${SIM_OPERATOR:-unknown}"
+    warn "  Reason:     $PARKED_REASON"
+    warn "  Detail:     $PARKED_DETAIL"
+    warn "  DB status:  $DB_STATUS"
+    warn ""
+    warn "  Action:     check carrier portal for this SIM's status,"
+    warn "              then re-provision:"
+    warn "                bash provision.sh --qr-code $QR_CODE --skip-flash"
+    warn "═══════════════════════════════════════"
+    exit 2
 else
     log "=== Step 5: Verify provisioning ==="
     # Wait for SSH to come back (dnsmasq restart in RNDIS local mode briefly drops USB network)

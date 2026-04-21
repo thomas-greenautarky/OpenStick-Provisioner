@@ -78,14 +78,24 @@ db_init() {
     # sim_operator is MCC+MNC (e.g. 26202 = Vodafone DE) — lets us audit which
     # carrier a given dongle is on without parsing the IMSI prefix by hand.
     db_query "ALTER TABLE ${DB_SCHEMA}.devices
-        ADD COLUMN IF NOT EXISTS dongle_type   TEXT,
-        ADD COLUMN IF NOT EXISTS hwid          TEXT,
-        ADD COLUMN IF NOT EXISTS msm_id        TEXT,
-        ADD COLUMN IF NOT EXISTS emmc_sectors  BIGINT,
-        ADD COLUMN IF NOT EXISTS dt_model      TEXT,
-        ADD COLUMN IF NOT EXISTS dt_compatible TEXT,
-        ADD COLUMN IF NOT EXISTS imsi          TEXT,
-        ADD COLUMN IF NOT EXISTS sim_operator  TEXT;" || true
+        ADD COLUMN IF NOT EXISTS dongle_type          TEXT,
+        ADD COLUMN IF NOT EXISTS hwid                 TEXT,
+        ADD COLUMN IF NOT EXISTS msm_id               TEXT,
+        ADD COLUMN IF NOT EXISTS emmc_sectors         BIGINT,
+        ADD COLUMN IF NOT EXISTS dt_model             TEXT,
+        ADD COLUMN IF NOT EXISTS dt_compatible        TEXT,
+        ADD COLUMN IF NOT EXISTS imsi                 TEXT,
+        ADD COLUMN IF NOT EXISTS sim_operator         TEXT,
+        ADD COLUMN IF NOT EXISTS provisioning_status  TEXT DEFAULT 'provisioned',
+        ADD COLUMN IF NOT EXISTS parked_reason        TEXT;" || true
+    # provisioning_status semantics:
+    #   'provisioned'           — normal, all steps succeeded
+    #   'parked_sim_inactive'   — modem never registered (SIM needs carrier activation)
+    #   'parked_no_signal'      — modem registered but can't reach NetBird / internet
+    #   'parked_flash_fail'     — flash incomplete (rare, needs manual recovery)
+    # Parked rows get a minimal set of columns filled in; the missing ones
+    # (netbird_ip, netbird_hostname, phone_number, etc.) stay NULL until a
+    # successful re-provisioning.
     # IMSI is unique per SIM, but SIMs can be moved between dongles, so we
     # do NOT put a UNIQUE constraint on it. An index helps lookups like
     # "which dongle currently has this SIM?".
@@ -124,6 +134,39 @@ db_record_device() {
             dt_compatible    = COALESCE(NULLIF(EXCLUDED.dt_compatible, ''), ${DB_SCHEMA}.devices.dt_compatible),
             imsi             = COALESCE(EXCLUDED.imsi,                       ${DB_SCHEMA}.devices.imsi),
             sim_operator     = COALESCE(EXCLUDED.sim_operator,               ${DB_SCHEMA}.devices.sim_operator),
+            provisioning_status = 'provisioned',
+            parked_reason    = NULL,
             provisioned_at   = NOW();
     " || { warn "Failed to record device in DB"; return 1; }
+}
+
+# ─── Record a parked device (partial provisioning — SIM/signal/flash issue) ──
+#
+# Called when provisioning can't proceed to NetBird enrollment. Writes a
+# minimal row so the device appears in fleet audits with the reason. Can be
+# safely superseded later by a successful db_record_device() call on the
+# same IMEI (UPSERT path clears parked_reason and sets provisioning_status
+# back to 'provisioned').
+db_record_parked() {
+    local imei="$1" serial="$2" qr_code="$3" dongle_type="$4" imsi="$5" sim_operator="$6"
+    local reason="$7" detail="$8"
+
+    db_query "
+        INSERT INTO ${DB_SCHEMA}.devices
+            (imei, serial_number, qr_code, firmware_version, dongle_type,
+             imsi, sim_operator, provisioning_status, parked_reason, provisioned_at)
+        VALUES
+            ('${imei}', '${serial}', '${qr_code}', '-', '${dongle_type}',
+             NULLIF('${imsi}',''), NULLIF('${sim_operator}',''),
+             '${reason}', NULLIF('${detail}',''), NOW())
+        ON CONFLICT (imei) DO UPDATE SET
+            serial_number       = EXCLUDED.serial_number,
+            qr_code             = EXCLUDED.qr_code,
+            dongle_type         = EXCLUDED.dongle_type,
+            imsi                = COALESCE(EXCLUDED.imsi,         ${DB_SCHEMA}.devices.imsi),
+            sim_operator        = COALESCE(EXCLUDED.sim_operator, ${DB_SCHEMA}.devices.sim_operator),
+            provisioning_status = EXCLUDED.provisioning_status,
+            parked_reason       = EXCLUDED.parked_reason,
+            provisioned_at      = NOW();
+    " || { warn "Failed to record parked device in DB"; return 1; }
 }
