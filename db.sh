@@ -72,14 +72,24 @@ db_init() {
             provisioned_at  TIMESTAMPTZ DEFAULT NOW()
         );
     " || { warn "Failed to init DB schema"; return 1; }
-    # Add new columns to pre-existing deployments (idempotent)
+    # Add new columns to pre-existing deployments (idempotent).
+    # imsi + sim_operator were added to track SIM identity (M2M/IoT SIMs
+    # typically have no MSISDN, so imsi is the only stable per-SIM identifier).
+    # sim_operator is MCC+MNC (e.g. 26202 = Vodafone DE) — lets us audit which
+    # carrier a given dongle is on without parsing the IMSI prefix by hand.
     db_query "ALTER TABLE ${DB_SCHEMA}.devices
         ADD COLUMN IF NOT EXISTS dongle_type   TEXT,
         ADD COLUMN IF NOT EXISTS hwid          TEXT,
         ADD COLUMN IF NOT EXISTS msm_id        TEXT,
         ADD COLUMN IF NOT EXISTS emmc_sectors  BIGINT,
         ADD COLUMN IF NOT EXISTS dt_model      TEXT,
-        ADD COLUMN IF NOT EXISTS dt_compatible TEXT;" || true
+        ADD COLUMN IF NOT EXISTS dt_compatible TEXT,
+        ADD COLUMN IF NOT EXISTS imsi          TEXT,
+        ADD COLUMN IF NOT EXISTS sim_operator  TEXT;" || true
+    # IMSI is unique per SIM, but SIMs can be moved between dongles, so we
+    # do NOT put a UNIQUE constraint on it. An index helps lookups like
+    # "which dongle currently has this SIM?".
+    db_query "CREATE INDEX IF NOT EXISTS devices_imsi_idx ON ${DB_SCHEMA}.devices (imsi);" || true
 }
 
 # ─── Record device (UPSERT on imei) ────────────────────────────────────────
@@ -88,14 +98,16 @@ db_record_device() {
     local imei="$1" serial="$2" qr_code="$3" fw_version="$4" phone="$5" nb_ip="$6" nb_hostname="$7" hostname="$8"
     local dongle_type="${9:-unknown}"
     local hwid="${10:-}" msm_id="${11:-}" emmc_sectors="${12:-0}" dt_model="${13:-}" dt_compatible="${14:-}"
+    local imsi="${15:-}" sim_operator="${16:-}"
 
     db_query "
         INSERT INTO ${DB_SCHEMA}.devices
             (imei, serial_number, qr_code, firmware_version, phone_number, netbird_ip, netbird_hostname, hostname,
-             dongle_type, hwid, msm_id, emmc_sectors, dt_model, dt_compatible, provisioned_at)
+             dongle_type, hwid, msm_id, emmc_sectors, dt_model, dt_compatible, imsi, sim_operator, provisioned_at)
         VALUES
             ('${imei}', '${serial}', '${qr_code}', '${fw_version}', '${phone}', '${nb_ip}', '${nb_hostname}', '${hostname}',
-             '${dongle_type}', '${hwid}', '${msm_id}', NULLIF('${emmc_sectors}','0')::BIGINT, '${dt_model}', '${dt_compatible}', NOW())
+             '${dongle_type}', '${hwid}', '${msm_id}', NULLIF('${emmc_sectors}','0')::BIGINT, '${dt_model}', '${dt_compatible}',
+             NULLIF('${imsi}',''), NULLIF('${sim_operator}',''), NOW())
         ON CONFLICT (imei) DO UPDATE SET
             serial_number    = EXCLUDED.serial_number,
             qr_code          = EXCLUDED.qr_code,
@@ -110,6 +122,8 @@ db_record_device() {
             emmc_sectors     = COALESCE(EXCLUDED.emmc_sectors,              ${DB_SCHEMA}.devices.emmc_sectors),
             dt_model         = COALESCE(NULLIF(EXCLUDED.dt_model, ''),      ${DB_SCHEMA}.devices.dt_model),
             dt_compatible    = COALESCE(NULLIF(EXCLUDED.dt_compatible, ''), ${DB_SCHEMA}.devices.dt_compatible),
+            imsi             = COALESCE(EXCLUDED.imsi,                       ${DB_SCHEMA}.devices.imsi),
+            sim_operator     = COALESCE(EXCLUDED.sim_operator,               ${DB_SCHEMA}.devices.sim_operator),
             provisioned_at   = NOW();
     " || { warn "Failed to record device in DB"; return 1; }
 }

@@ -99,6 +99,9 @@ and [`variant-strategy.md`](https://github.com/thomas-greenautarky/USB-Dongle-Op
 | Dongle enumerates only as EDL (`05c6:9008`) | Boot chain broken (failed flash, PBL fallback) | Re-run `provision.sh` — flash-uz801.sh accepts EDL-state dongles and re-flashes |
 | Dongle doesn't enumerate at all | Hardware-level brick (sbl1 corrupted) | Needs D+/GND short on USB cable or PCB testpoint — no software recovery possible |
 | Host internet drops when dongle boots | Old `enx*`-matching NM profile | Run `sudo bash setup-host.sh` — creates the correct `match.driver=rndis_host` profile |
+| `netbird up` hangs forever after flash | Dongle clock in the past (no RTC battery) → TLS to `api.netbird.io` rejected with "certificate not yet valid" | Auto-handled by `provision.sh` (calls `sync_dongle_time` before `netbird up`). Manual: `ssh root@dongle date -u -s "$(date -u +'%Y-%m-%d %H:%M:%S')"` |
+| LTE ping test fails on otherwise-working SIM | IoT SIMs (e.g. Vodafone `inetd.vodafone.iot`) run an **FQDN-whitelist ACL** — raw-IP ICMP/TCP to 8.8.8.8 / 1.1.1.1 is blackholed by the carrier, even though HTTPS to allowed hostnames works fine | `test-provision.sh` now probes `https://api.netbird.io/` (whitelisted, and exactly what NetBird actually needs) instead of pinging. Override with `LTE_PROBE_URL` in `provision.conf` if your ACL blocks `api.netbird.io` |
+| `wwan0` has no IP, no default route after boot | `modem-autoconnect.service` lost the race on first boot (modem not yet registered) so the default bearer was never created | Auto-handled by `provision.sh` (calls `ensure_lte_data_up "$APN"` before `netbird up`: runs `mmcli --simple-connect`, then applies the bearer's IP/GW/DNS to `wwan0`). Idempotent — fine to re-run |
 
 ## Usage
 
@@ -278,7 +281,9 @@ This file is gitignored. See `database.conf.example` for a template.
 | `serial_number` | `TEXT` | Hardware serial (device tree / cpuinfo / eMMC) |
 | `qr_code` | `TEXT` | Scanned QR code (e.g. `SIM-WIN-00000001`) |
 | `firmware_version` | `TEXT NOT NULL` | Image version label (e.g. `v1.0`) |
-| `phone_number` | `TEXT` | SIM card phone number |
+| `phone_number` | `TEXT` | SIM MSISDN (often empty on M2M/IoT SIMs — use `imsi` instead) |
+| `imsi` | `TEXT` (indexed) | SIM IMSI — stable per-SIM identifier; tracks SIM movements between dongles |
+| `sim_operator` | `TEXT` | MCC+MNC code from SIM (e.g. `26202` = Vodafone DE) |
 | `netbird_ip` | `TEXT` | NetBird VPN IP address |
 | `netbird_hostname` | `TEXT` | NetBird peer name (= dongle hostname) |
 | `hostname` | `TEXT` | Dongle hostname (e.g. `ga-3112`) |

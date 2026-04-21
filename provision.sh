@@ -53,7 +53,111 @@ which sshpass >/dev/null 2>&1 || err "sshpass not installed (apt install sshpass
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
 ssh_cmd() { SSHPASS="$DONGLE_PASS" sshpass -e ssh $SSH_OPTS "$DONGLE_USER@$DONGLE_IP" "$1" 2>/dev/null; }
+# ssh_bash: pipe a local script to the dongle via stdin (no escape-hell for
+# multi-line remote snippets). Arguments after the function name become $1..
+# inside the script.
+ssh_bash() { SSHPASS="$DONGLE_PASS" sshpass -e ssh $SSH_OPTS "$DONGLE_USER@$DONGLE_IP" "bash -s -- $*" 2>/dev/null; }
 scp_cmd() { SSHPASS="$DONGLE_PASS" sshpass -e scp $SSH_OPTS "$1" "$DONGLE_USER@$DONGLE_IP:$2" 2>/dev/null; }
+
+# ─── sync_dongle_time ───────────────────────────────────────────────────────
+# The UZ801 has no RTC battery — on every cold boot its clock resets to the
+# rootfs build timestamp. With a clock in the past, TLS handshakes to any
+# HTTPS endpoint fail with "certificate is not yet valid" (because the server
+# cert was issued *after* the dongle thinks "now" is). That kills `netbird up`
+# and any NTP-over-HTTPS time-sync.
+#
+# The rootfs ships a `clock-sync.service`, but it needs working internet —
+# which itself needs `netbird up` — which itself needs correct time. Chicken
+# & egg. So we break the loop here by pushing the host clock into the dongle
+# right after SSH is reachable, before we do anything that needs TLS.
+sync_dongle_time() {
+    local now_utc remote
+    now_utc=$(date -u +'%Y-%m-%d %H:%M:%S')
+    remote=$(ssh_cmd "date -u -s '$now_utc' >/dev/null 2>&1; hwclock -w 2>/dev/null; date -u +%Y-%m-%dT%H:%M:%SZ")
+    if [ -n "$remote" ]; then
+        log "  Time synced: dongle is now $remote (host: ${now_utc}Z)"
+    else
+        warn "  Time sync failed — TLS calls to NetBird may fail ('cert not yet valid')"
+    fi
+}
+
+# ─── ensure_lte_data_up ─────────────────────────────────────────────────────
+# ModemManager's *default-attach* bearer provides only LTE attach (registration)
+# — no user data traffic. A separate *default* bearer must be created via
+# --simple-connect, and its IPv4 address/gateway/DNS must be applied to wwan0
+# manually (there is no DHCP on the modem's raw IP interface).
+#
+# The rootfs ships a `modem-autoconnect.service` that does exactly this at
+# boot, but on first boot it sometimes runs before the modem has registered,
+# or times out. In that case wwan0 comes up but has no IP, no default route,
+# so `netbird up` hangs (and curl/ping/anything else is blackholed). This
+# helper is a belt-and-suspenders: if wwan0 already looks good we skip, else
+# we run simple-connect + apply bearer config ourselves.
+#
+# Idempotent — safe to call multiple times.
+ensure_lte_data_up() {
+    local apn="$1"
+    local result
+    result=$(ssh_bash "$apn" <<'REMOTE_LTE_UP'
+set -e
+apn="$1"
+
+# Fast path: wwan0 has an IPv4 and default route is via wwan0 → done.
+if ip -4 addr show wwan0 2>/dev/null | grep -q 'inet ' \
+   && ip route show default 2>/dev/null | grep -q 'dev wwan0'; then
+    echo "already-up"
+    exit 0
+fi
+
+# Trigger a simple-connect on modem 0 (creates a 'default' bearer if none
+# yet, or reuses an existing connected one).
+if ! mmcli -m 0 --simple-connect="apn=$apn,ip-type=ipv4" 2>&1 | grep -q "successfully connected"; then
+    # It's OK to already be connected — mmcli will say so. Anything else is an error.
+    mmcli -m 0 2>&1 | grep -q "state: connected" || { echo "simple-connect-failed"; exit 1; }
+fi
+
+# Walk all bearers and pick the one that is (type=default + connected=yes).
+# Avoid the default-attach bearer (same APN but no user data).
+bearers=$(mmcli -m 0 -K 2>/dev/null | awk -F'[ ,]+' '/bearers/ { for(i=2;i<=NF;i++) if($i~/^\//) print $i }')
+for b in $bearers; do
+    out=$(mmcli -m 0 --bearer="$b" -K 2>/dev/null)
+    echo "$out" | grep -q 'bearer.properties.type.*\<default\>' || continue
+    echo "$out" | grep -q 'bearer.status.connected.*\<yes\>'    || continue
+
+    ip=$(echo "$out"  | awk -F': +' '/bearer.ipv4-config.address/ {print $2; exit}')
+    pfx=$(echo "$out" | awk -F': +' '/bearer.ipv4-config.prefix/  {print $2; exit}')
+    gw=$(echo "$out"  | awk -F': +' '/bearer.ipv4-config.gateway/ {print $2; exit}')
+    dns=$(echo "$out" | awk -F': +' '/bearer.ipv4-config.dns.value/ {print $2; exit}')
+
+    [ -n "$ip" ] && [ -n "$gw" ] || continue
+
+    ip link set wwan0 up
+    ip addr flush dev wwan0 2>/dev/null || true
+    ip addr add "$ip/$pfx" dev wwan0
+    # Use a higher metric than the RNDIS route so host-originated traffic via
+    # usb0 keeps its own gateway; only wwan0-destined traffic uses this route.
+    ip route replace default via "$gw" dev wwan0 metric 200
+    [ -n "$dns" ] && echo "nameserver $dns" > /etc/resolv.conf
+    echo "configured $ip/$pfx via $gw dns=${dns:-<none>}"
+    exit 0
+done
+echo "no-default-bearer"
+exit 1
+REMOTE_LTE_UP
+)
+    case "$result" in
+        already-up)
+            log "  LTE data: wwan0 already up"
+            ;;
+        configured*)
+            log "  LTE data: ${result#configured }"
+            ;;
+        *)
+            warn "  LTE data bring-up failed: ${result:-<no output>}"
+            return 1
+            ;;
+    esac
+}
 
 derive_wifi_psk() {
     local ssid="$1"
@@ -349,6 +453,17 @@ SSID="GA-${LAST4}"
 PSK=$(derive_wifi_psk "$SSID")
 HOSTNAME="ga-${LAST4}"
 
+# IMSI identifies the SIM card itself (not the modem). We track it in the
+# database so we can tell which SIM is in which dongle — M2M/IoT SIMs
+# typically have no MSISDN (phone_number stays empty) and IMSI is the only
+# stable SIM identifier. Also useful for fleet audits ("which SIM is where?").
+IMSI=$(ssh_cmd "mmcli -i 0 -K 2>/dev/null | awk -F': +' '/sim.properties.imsi/{print \$2; exit}' | xargs")
+[ "$IMSI" = "--" ] && IMSI=""
+# SIM operator code (MCC+MNC, e.g. 26202 = Vodafone DE) — helps correlate
+# IMSIs with carriers without looking up the IMSI prefix manually.
+SIM_OPERATOR=$(ssh_cmd "mmcli -i 0 -K 2>/dev/null | awk -F': +' '/sim.properties.operator-code/{print \$2; exit}' | xargs")
+[ "$SIM_OPERATOR" = "--" ] && SIM_OPERATOR=""
+
 # Read hardware serial number (try device tree, then cpuinfo, then eMMC CID)
 SERIAL_NUMBER=$(ssh_cmd "cat /sys/firmware/devicetree/base/serial-number 2>/dev/null | tr -d '\0'" || true)
 if [ -z "$SERIAL_NUMBER" ]; then
@@ -374,6 +489,7 @@ PHONE_NUMBER=$(ssh_cmd "mmcli -m 0 -K 2>/dev/null | grep 'modem.generic.own-numb
 [ -z "$PHONE_NUMBER" ] || [ "$PHONE_NUMBER" = "--" ] && PHONE_NUMBER=""
 
 log "  IMEI:     $IMEI"
+log "  IMSI:     ${IMSI:-<not available>}${SIM_OPERATOR:+ (MCC+MNC $SIM_OPERATOR)}"
 log "  Serial:   ${SERIAL_NUMBER:-unknown}"
 log "  Type:     $DONGLE_TYPE${DT_MODEL:+ ($DT_MODEL)}"
 log "  HWID:     ${DONGLE_HWID:-unknown}"
@@ -406,6 +522,112 @@ if [ -n "$ROOT_PASSWORD" ]; then
 fi
 
 # WiFi hotspot
+# ─── LED fixes ──────────────────────────────────────────────────────────────
+# Two changes here:
+#
+#   1. Replace /usr/local/bin/led-status.sh with a version that would use the
+#      kernel's netdev trigger if present. On the current rootfs kernel,
+#      CONFIG_LEDS_TRIGGER_NETDEV is NOT compiled in (we checked) — so that
+#      path falls back to leaving the LED under userspace control (trigger=none).
+#
+#   2. Install a tiny userspace watcher (`led-lte-watcher.service`) that polls
+#      ModemManager every 5s and sets the :wan LED brightness from the real
+#      LTE connection state. This is the honest status light the user actually
+#      wants: LED on iff wwan0 carries data.
+#
+# Both steps are idempotent — every provisioning run overwrites them. The
+# permanent fix is to enable CONFIG_LEDS_TRIGGER_NETDEV in the rootfs kernel
+# (tracked in USB-Dongle-OpenStick/TODO.md). When that happens, the watcher
+# can be removed and led-status.sh alone will do the job.
+ssh_bash <<'REMOTE_LED_FIX'
+set -e
+
+# (1) Improved led-status.sh — ready for kernels WITH netdev trigger.
+cat > /usr/local/bin/led-status.sh <<'LED_SCRIPT'
+#!/bin/sh
+# led-status.sh — Configure status LEDs across different MSM8916 dongle variants.
+# Updated by OpenStick-Provisioner. On kernels with CONFIG_LEDS_TRIGGER_NETDEV
+# the :wan LED is wired directly to wwan0 link state. On kernels without it,
+# the LED is left under userspace control — led-lte-watcher.service drives it.
+set -eu
+
+set_trigger() {
+    led="$1"; preferred="$2"; fallback="$3"
+    [ -d "$led" ] || return 0
+    echo "$preferred" > "$led/trigger" 2>/dev/null && return 0
+    echo "$fallback"  > "$led/trigger" 2>/dev/null || true
+}
+
+# Wire LED to netdev interface's link state, if kernel supports it.
+# Otherwise leave trigger=none so the userspace watcher can take over.
+set_trigger_netdev() {
+    led="$1"; dev="$2"
+    [ -d "$led" ] || return 0
+    if echo netdev > "$led/trigger" 2>/dev/null && [ -f "$led/device_name" ]; then
+        echo "$dev" > "$led/device_name" 2>/dev/null || true
+        echo 1      > "$led/link"        2>/dev/null || true
+        return 0
+    fi
+    echo none > "$led/trigger" 2>/dev/null || true
+}
+
+for led in /sys/class/leds/*; do
+    [ -d "$led" ] || continue
+    name=$(basename "$led")
+    case "$name" in
+        *:wan|*:wwan|*:lte|*:mobile) set_trigger_netdev "$led" wwan0 ;;
+        *:wlan|*:wifi)               set_trigger "$led" phy0assoc default-on ;;
+        *:power)                     echo 1 > "$led/brightness" 2>/dev/null || true ;;
+    esac
+done
+LED_SCRIPT
+chmod +x /usr/local/bin/led-status.sh
+
+# (2) Userspace LTE link watcher — drives :wan LED based on real modem state.
+cat > /usr/local/bin/led-lte-watcher.sh <<'WATCHER'
+#!/bin/sh
+# LTE link watcher — polls ModemManager every 5s and sets the *:wan LED
+# brightness from the real connection state. Only needed on kernels without
+# CONFIG_LEDS_TRIGGER_NETDEV. Remove this service (and this script) once the
+# rootfs kernel has the netdev LED trigger compiled in.
+set -eu
+WAN_LEDS=$(ls -d /sys/class/leds/*:wan /sys/class/leds/*:wwan /sys/class/leds/*:lte /sys/class/leds/*:mobile 2>/dev/null || true)
+[ -n "$WAN_LEDS" ] || exit 0
+for led in $WAN_LEDS; do echo none > "$led/trigger" 2>/dev/null || true; done
+while :; do
+    bright=0
+    if ip link show wwan0 2>/dev/null | grep -q LOWER_UP; then
+        state=$(mmcli -m 0 -K 2>/dev/null | awk -F': +' '/generic.state /{print $2; exit}' | xargs)
+        [ "$state" = "connected" ] && bright=1
+    fi
+    for led in $WAN_LEDS; do echo "$bright" > "$led/brightness" 2>/dev/null || true; done
+    sleep 5
+done
+WATCHER
+chmod +x /usr/local/bin/led-lte-watcher.sh
+
+cat > /etc/systemd/system/led-lte-watcher.service <<'UNIT'
+[Unit]
+Description=LTE link watcher driving :wan LED (userspace fallback for kernels without LEDS_TRIGGER_NETDEV)
+After=ModemManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/led-lte-watcher.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl restart led-status.service
+systemctl enable  led-lte-watcher.service
+systemctl restart led-lte-watcher.service
+REMOTE_LED_FIX
+log "  LED: deployed led-status.sh + led-lte-watcher.service (real LTE link state)"
+
 ssh_cmd "
 nmcli connection delete hotspot 2>/dev/null || true
 nmcli connection add type wifi ifname wlan0 con-name hotspot \
@@ -421,6 +643,17 @@ if $PREP_MODE; then
     log "  NetBird: skipped (prep mode, no internet)"
 elif [ -n "$NETBIRD_SETUP_KEY" ] && [ "$NETBIRD_SETUP_KEY" != "nb-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX" ]; then
     if ssh_cmd "which netbird" >/dev/null 2>&1; then
+        # Pre-requisites for `netbird up`:
+        #   1. Correct system time (TLS to api.netbird.io otherwise fails with
+        #      "certificate not yet valid" — dongle has no RTC, boots with
+        #      the rootfs build date).
+        #   2. wwan0 must carry user data (default bearer + IP + default route
+        #      — the default-attach bearer alone is not enough).
+        # Both should be handled by rootfs services (clock-sync.service,
+        # modem-autoconnect.service) on subsequent boots, but on first boot
+        # they can lose the race with this provisioning step.
+        sync_dongle_time
+        ensure_lte_data_up "$APN"
         ssh_cmd "netbird up --setup-key '$NETBIRD_SETUP_KEY'" 2>/dev/null
         NB_IP=$(ssh_cmd "netbird status 2>/dev/null | grep 'NetBird IP' | awk '{print \$NF}'" 2>/dev/null)
         log "  NetBird VPN: connected ($NB_IP)"
@@ -490,7 +723,7 @@ else
             db_record_device "$IMEI" "${SERIAL_NUMBER:-}" "$QR_CODE" "$FIRMWARE_VERSION" \
                 "${PHONE_NUMBER:-}" "${NB_IP:-}" "$HOSTNAME" "$HOSTNAME" "$DONGLE_TYPE" \
                 "${DONGLE_HWID:-}" "${DONGLE_MSM_ID:-}" "${DONGLE_EMMC_SECTORS:-0}" \
-                "${DT_MODEL:-}" "${DT_COMPATIBLE:-}" && \
+                "${DT_MODEL:-}" "${DT_COMPATIBLE:-}" "${IMSI:-}" "${SIM_OPERATOR:-}" && \
                 DB_STATUS="recorded" || DB_STATUS="failed"
         else
             DB_STATUS="no config"

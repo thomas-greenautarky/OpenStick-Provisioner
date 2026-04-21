@@ -189,12 +189,40 @@ else
     fail "Modem state" "got $LTE_STATE"
 fi
 
-LTE_PING=$(ssh_cmd "ping -c 2 -W 5 8.8.8.8 2>/dev/null")
-if echo "$LTE_PING" | grep -q "bytes from"; then
-    RTT=$(echo "$LTE_PING" | grep avg | awk -F'/' '{print $5}')
-    pass "LTE ping 8.8.8.8 (${RTT}ms)"
+# LTE data path reachability.
+#
+# We do NOT ping 8.8.8.8 / 1.1.1.1 anymore. Many IoT APNs (e.g. Vodafone
+# inetd.vodafone.iot with an FQDN-whitelist ACL) silently blackhole ICMP
+# and raw-IP traffic — only traffic to whitelisted hostnames is allowed.
+# A ping to a raw public IP therefore fails on perfectly-working SIMs and
+# gives a false negative.
+#
+# Instead we probe `api.netbird.io` over HTTPS. This single call verifies:
+#   • DNS works on the dongle (FQDN resolves)
+#   • The data bearer carries TCP (not just LTE attach)
+#   • TLS handshake completes (cert chain verifies → DNS + network + CA store)
+#   • System clock is correct (otherwise cert "not yet valid")
+#   • The ACL permits the NetBird API endpoint (which is what NetBird actually
+#     needs to work — we test the real dependency, not a proxy for it)
+#
+# The default `ghcr.io` was chosen because it is in the Greenautarky fleet's
+# Vodafone IoT ACL *and* consistently returns a TLS-verified HTTP response.
+# `api.netbird.io` is also in the ACL but occasionally resets the connection
+# mid-TLS from this APN (root cause unclear — possibly upstream-IP drift,
+# possibly SNI-based filtering), so we don't probe it as a health check.
+# Override via `LTE_PROBE_URL` in `provision.conf` for fleets with different
+# ACLs.
+LTE_PROBE_URL="${LTE_PROBE_URL:-https://ghcr.io/}"
+LTE_PROBE=$(ssh_cmd "curl -sS --max-time 10 -o /dev/null -w '%{http_code}|%{ssl_verify_result}|%{time_total}' '$LTE_PROBE_URL' 2>&1")
+HTTP_CODE=$(echo "$LTE_PROBE" | awk -F'|' '{print $1}')
+SSL_OK=$(echo "$LTE_PROBE"    | awk -F'|' '{print $2}')
+RTT_S=$(echo "$LTE_PROBE"     | awk -F'|' '{print $3}')
+if [ -n "$HTTP_CODE" ] && [ "$HTTP_CODE" != "000" ] && [ "$SSL_OK" = "0" ]; then
+    # Round RTT to ms for readability.
+    RTT_MS=$(awk -v s="$RTT_S" 'BEGIN{printf "%.0f", s*1000}' 2>/dev/null)
+    pass "LTE HTTPS ($LTE_PROBE_URL → HTTP $HTTP_CODE, TLS ok, ${RTT_MS}ms)"
 else
-    fail "LTE ping" "no reply from 8.8.8.8"
+    fail "LTE HTTPS" "$LTE_PROBE_URL unreachable (http=${HTTP_CODE:-none}, tls=${SSL_OK:-?})"
 fi
 
 # ─── 6. NetBird VPN ────────────────────────────────────────────────────────
