@@ -75,6 +75,44 @@ test-provision.sh, db.sh, setup-host.sh). Rootfs-side TODOs live in
       carrier-ACL-sensitive. `LTE_PROBE_URL` env override is already
       wired in `test-provision.sh`; expose it in `provision.conf`.
 
+## Validation tests
+
+- [ ] End-to-end **Kibu + Tailscale Funnel** validation (optional
+      `--test-kibu` flag on `provision.sh`, or separate script).
+      Idea: just after Step 7 system tests pass, spin up a mini e2e
+      that proves a real downstream workload works through the dongle.
+
+      Steps:
+      1. Attach a reference Kibu to the dongle's WiFi hotspot
+         (GA-XXXX, PSK from derive_wifi_psk).
+      2. On the Kibu: verify it got an IP from 192.168.4.0/24 and
+         the gateway is 192.168.4.1 (the dongle).
+      3. On the Kibu: `curl https://ghcr.io/` — proves the dongle's
+         MASQUERADE path works and the ACL lets the Kibu through.
+      4. On the Kibu: `tailscale up --authkey <key>` — proves Tailscale
+         enroll works via LTE (ACL has controlplane + login + derp +
+         log all whitelisted, plus time.cloudflare.com for NTP).
+      5. On the Kibu: `tailscale funnel 8080 on` — exposes a local
+         service publicly via Funnel.
+      6. From the provisioning host (or external runner): fetch the
+         funnel URL, assert HTTP 200 and expected content.
+      7. Record latency, bytes-transferred (relevant for IoT SIM
+         data cap), and which DERP region was used.
+
+      Why this matters: all 7 post-flash test categories can PASS
+      while the real workload — "a Kibu should be reachable from
+      outside via Funnel" — still fails for reasons the current
+      tests don't cover (Tailscale tag/ACL mismatches, Funnel
+      feature not enabled on the tailnet, DERP reachability quirks
+      specific to this carrier, etc.). An e2e test catches those.
+
+      Caveats to design for:
+      - Data-cap-awareness: limit probe payload size (< few KB).
+      - Don't burn a real setup-key per test run: use a short-lived
+        OAuth key or a per-fleet reusable key with expiry.
+      - Only run when `--test-kibu` is explicitly requested — not
+        every provisioning run needs physical Kibu hardware present.
+
 ## Observability
 
 - [ ] Stream `provision.sh` output into the DB (per-device log blob) so

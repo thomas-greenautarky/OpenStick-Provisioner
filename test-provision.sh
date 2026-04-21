@@ -244,9 +244,52 @@ if [ -n "${NETBIRD_SETUP_KEY:-}" ] && [ "$NETBIRD_SETUP_KEY" != "nb-XXXXXXXX-XXX
     else
         fail "NetBird IP" "not assigned"
     fi
+
+    # NetBird peer-identity uniqueness check against the inventory DB.
+    #
+    # A known failure mode: the rootfs can ship with a pre-enrolled NetBird
+    # state (/var/lib/netbird/config.json), so every dongle registers with
+    # the same WireGuard key and silently overwrites the previous dongle's
+    # NetBird peer on the cloud side. The old dongle becomes unreachable
+    # without any visible error during provisioning.
+    #
+    # Catch that here: if any OTHER IMEI in the DB already has this
+    # netbird_ip or netbird_hostname, the collision is real and this
+    # provisioning must be marked as failed (the DB write is gated on
+    # verify success, so a FAIL here prevents us from clobbering an
+    # existing row AND surfaces the problem before the dongle ships).
+    NB_FQDN_NOW=$(ssh_cmd "netbird status 2>/dev/null | awk -F': +' '/FQDN/{print \$2; exit}' | xargs")
+    if [ -n "$NB_IP" ] && [ -f "$SCRIPT_DIR/database.conf" ]; then
+        # shellcheck disable=SC1091
+        source "$SCRIPT_DIR/db.sh" 2>/dev/null
+        if db_load_config 2>/dev/null; then
+            dupe=$(db_query "
+                SELECT imei FROM ${DB_SCHEMA}.devices
+                WHERE imei <> '${IMEI}'
+                  AND (netbird_ip = '${NB_IP}' OR netbird_hostname = '${NB_FQDN_NOW}')
+                LIMIT 1;
+            " 2>/dev/null | awk 'NR==3 {print $1}')
+            if [ -n "$dupe" ] && [ "$dupe" != "imei" ]; then
+                fail "NetBird peer uniqueness" \
+                    "collision — $NB_IP / $NB_FQDN_NOW already belongs to IMEI $dupe. \
+This dongle has NOT been enrolled as a new peer. Likely cause: rootfs \
+shipped pre-enrolled NetBird state, or netbird daemon picked up stale \
+identity before hostname was applied. Check /var/lib/netbird/ on both \
+dongles, and ensure provision.sh runs 'netbird up --hostname <QR>' \
+against a clean state."
+            else
+                pass "NetBird peer uniqueness (no collision in DB)"
+            fi
+        else
+            skip "NetBird peer uniqueness" "DB not reachable"
+        fi
+    else
+        skip "NetBird peer uniqueness" "no DB configured"
+    fi
 else
     skip "NetBird" "no setup key in .env"
     skip "NetBird IP" "no setup key in .env"
+    skip "NetBird peer uniqueness" "no setup key"
 fi
 
 # ─── 7. RNDIS ──────────────────────────────────────────────────────────────

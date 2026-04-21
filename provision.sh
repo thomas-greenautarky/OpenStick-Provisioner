@@ -118,16 +118,22 @@ fi
 
 # Walk all bearers and pick the one that is (type=default + connected=yes).
 # Avoid the default-attach bearer (same APN but no user data).
+#
+# Note: in ModemManager 1.20 the field is `bearer.type` (not
+# `bearer.properties.type` — that sub-tree has apn, ip-type, roaming, etc.
+# but NOT the bearer kind). Parse line-anchored to avoid accidental matches.
 bearers=$(mmcli -m 0 -K 2>/dev/null | awk -F'[ ,]+' '/bearers/ { for(i=2;i<=NF;i++) if($i~/^\//) print $i }')
 for b in $bearers; do
     out=$(mmcli -m 0 --bearer="$b" -K 2>/dev/null)
-    echo "$out" | grep -q 'bearer.properties.type.*\<default\>' || continue
-    echo "$out" | grep -q 'bearer.status.connected.*\<yes\>'    || continue
+    btype=$(echo "$out" | awk -F': +' '/^bearer\.type / {print $2; exit}' | xargs)
+    bconn=$(echo "$out" | awk -F': +' '/^bearer\.status\.connected / {print $2; exit}' | xargs)
+    [ "$btype" = "default" ] || continue
+    [ "$bconn" = "yes" ]     || continue
 
-    ip=$(echo "$out"  | awk -F': +' '/bearer.ipv4-config.address/ {print $2; exit}')
-    pfx=$(echo "$out" | awk -F': +' '/bearer.ipv4-config.prefix/  {print $2; exit}')
-    gw=$(echo "$out"  | awk -F': +' '/bearer.ipv4-config.gateway/ {print $2; exit}')
-    dns=$(echo "$out" | awk -F': +' '/bearer.ipv4-config.dns.value/ {print $2; exit}')
+    ip=$(echo "$out"  | awk -F': +' '/bearer\.ipv4-config\.address/ {print $2; exit}' | xargs)
+    pfx=$(echo "$out" | awk -F': +' '/bearer\.ipv4-config\.prefix/  {print $2; exit}' | xargs)
+    gw=$(echo "$out"  | awk -F': +' '/bearer\.ipv4-config\.gateway/ {print $2; exit}' | xargs)
+    dns=$(echo "$out" | awk -F': +' '/bearer\.ipv4-config\.dns\.value\[1\]/ {print $2; exit}' | xargs)
 
     [ -n "$ip" ] && [ -n "$gw" ] || continue
 
@@ -502,9 +508,22 @@ log "  WiFi:     $SSID / $PSK"
 
 log "=== Step 4: Configure ==="
 
-# Hostname
+# Hostname.
+#
+# CRITICAL: the rootfs ships with a default hostname `ga-3112` (build-time
+# default). The netbird.service is started at boot BEFORE we get to set the
+# real hostname — so when `netbird up` runs later, the daemon reports itself
+# to the NetBird control plane as `ga-3112`. Because the setup-key is
+# reusable/ephemeral, EVERY new dongle registers on the same NetBird peer
+# entry and overwrites its predecessor. Result: only the last-provisioned
+# dongle is reachable, the rest are silently gone from the admin view.
+#
+# Fix: after changing the hostname, restart netbird so the daemon picks it
+# up before we call `netbird up`. The daemon reads the kernel hostname on
+# startup.
 ssh_cmd "echo '$HOSTNAME' > /etc/hostname && hostname '$HOSTNAME'"
-log "  Hostname set: $HOSTNAME"
+ssh_cmd "systemctl restart netbird 2>/dev/null || true"
+log "  Hostname set: $HOSTNAME (+ netbird daemon restart so the next 'netbird up' registers as a new peer, not overwriting ga-3112)"
 
 # APN
 ssh_cmd "echo '$APN' > /etc/default/lte-apn"
@@ -649,14 +668,34 @@ elif [ -n "$NETBIRD_SETUP_KEY" ] && [ "$NETBIRD_SETUP_KEY" != "nb-XXXXXXXX-XXXX-
         #      the rootfs build date).
         #   2. wwan0 must carry user data (default bearer + IP + default route
         #      — the default-attach bearer alone is not enough).
-        # Both should be handled by rootfs services (clock-sync.service,
-        # modem-autoconnect.service) on subsequent boots, but on first boot
-        # they can lose the race with this provisioning step.
+        #   3. No stale NetBird identity. The rootfs *may* ship with a
+        #      pre-enrolled state in /var/lib/netbird/ — if so, every dongle
+        #      would register with the same WireGuard key and overwrite each
+        #      other on the cloud side. We wipe that state here before the
+        #      first `netbird up` so each dongle generates a fresh identity.
+        #      This is safe: --setup-key re-enrolls from scratch.
+        #   4. NetBird peer hostname = the fleet-wide unique QR code
+        #      (SIM-WIN-XXXXXXXX), NOT the local system hostname (ga-XXXX,
+        #      where XXXX is the IMEI's last 4 digits and therefore not
+        #      guaranteed unique across large fleets). Using the QR makes
+        #      the NetBird dashboard instantly identifiable by business
+        #      ID and prevents namespace collisions entirely.
+        # Both (1) and (2) should be handled by rootfs services
+        # (clock-sync.service, modem-autoconnect.service) on subsequent
+        # boots, but on first boot they can lose the race with this step.
         sync_dongle_time
         ensure_lte_data_up "$APN"
-        ssh_cmd "netbird up --setup-key '$NETBIRD_SETUP_KEY'" 2>/dev/null
-        NB_IP=$(ssh_cmd "netbird status 2>/dev/null | grep 'NetBird IP' | awk '{print \$NF}'" 2>/dev/null)
-        log "  NetBird VPN: connected ($NB_IP)"
+        ssh_cmd "systemctl stop netbird 2>/dev/null; rm -rf /var/lib/netbird/* /etc/netbird.conf /etc/netbird/*.conf 2>/dev/null; systemctl start netbird 2>/dev/null; sleep 2"
+        ssh_cmd "netbird up --setup-key '$NETBIRD_SETUP_KEY' --hostname '$QR_CODE'" 2>/dev/null
+        # Capture both the peer IP and the NetBird FQDN. The FQDN is the
+        # real cloud-side identifier (e.g. `ga-3112-109-63.netbird.cloud`)
+        # — distinct from the dongle's local hostname (e.g. `ga-6892`).
+        # Both are recorded in the DB so operators can look a device up
+        # by either name and know how to SSH into it remotely.
+        NB_STATUS=$(ssh_cmd "netbird status 2>/dev/null" 2>/dev/null)
+        NB_IP=$(echo   "$NB_STATUS" | awk -F': +' '/NetBird IP/ {print $2; exit}' | awk '{print $1}')
+        NB_FQDN=$(echo "$NB_STATUS" | awk -F': +' '/FQDN/        {print $2; exit}' | awk '{print $1}')
+        log "  NetBird VPN: connected ($NB_IP, $NB_FQDN)"
     else
         warn "  NetBird not installed — rebuild base image"
     fi
@@ -721,7 +760,7 @@ else
         if db_load_config; then
             db_init && \
             db_record_device "$IMEI" "${SERIAL_NUMBER:-}" "$QR_CODE" "$FIRMWARE_VERSION" \
-                "${PHONE_NUMBER:-}" "${NB_IP:-}" "$HOSTNAME" "$HOSTNAME" "$DONGLE_TYPE" \
+                "${PHONE_NUMBER:-}" "${NB_IP:-}" "${NB_FQDN:-$HOSTNAME}" "$HOSTNAME" "$DONGLE_TYPE" \
                 "${DONGLE_HWID:-}" "${DONGLE_MSM_ID:-}" "${DONGLE_EMMC_SECTORS:-0}" \
                 "${DT_MODEL:-}" "${DT_COMPATIBLE:-}" "${IMSI:-}" "${SIM_OPERATOR:-}" && \
                 DB_STATUS="recorded" || DB_STATUS="failed"
@@ -748,12 +787,14 @@ log "  Device:    $HOSTNAME ($IMEI)"
 log "  Type:      $DONGLE_TYPE"
 log "  Serial:    ${SERIAL_NUMBER:-unknown}"
 log "  QR Code:   $QR_CODE"
-log "  Phone:     ${PHONE_NUMBER:-unknown}"
+log "  Phone:     ${PHONE_NUMBER:-unknown} (M2M/IoT SIMs usually have no MSISDN)"
+log "  IMSI:      ${IMSI:-unknown}${SIM_OPERATOR:+ (MCC+MNC $SIM_OPERATOR)}"
 log "  Firmware:  $FIRMWARE_VERSION"
 log "  WiFi:      $SSID"
 log "  RNDIS:    ${DISABLE_RNDIS:-no} (mode: ${RNDIS_MODE:-gateway})"
 log "  SSH:       ssh root@$DONGLE_IP"
 log "  APN:       $APN"
+log "  NetBird:   ${NB_IP:-<not assigned>}${NB_FQDN:+ ($NB_FQDN)}"
 log "  DB:        $DB_STATUS"
 if $PREP_MODE; then
     log "  Status:    PREP (flash + base config, no SIM)"
