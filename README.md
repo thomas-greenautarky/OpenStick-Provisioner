@@ -9,6 +9,17 @@ The base firmware (Debian 12 + kernel 6.6 + LTE) is built and flashed by the
 OpenStick repo. This tool orchestrates the full provisioning pipeline and records
 each successfully provisioned dongle to the database.
 
+**Two provisioning flows:**
+
+| Flow | Script | Applies to | What it does |
+|---|---|---|---|
+| **Primary** | `provision.sh` | OpenStick-flashed UZ801 / JZ0145 dongles | Full flash + configure + NetBird + DB record |
+| **Secondary** | `provision-arrow.sh` | **ARROW** dongles (ZTE "4G Modem" stock firmware on UZ801 hardware) | **No flash.** Configures WiFi SSID/PSK, APN, admin UI password via the stock web API so the unit becomes Kibu-compatible (same `GA-XXXX` SSID + derived PSK scheme) without replacing the firmware |
+
+See [ARROW Dongles (No-Flash Variant)](#arrow-dongles-no-flash-variant) for the
+secondary flow and [docs/arrow-api.md](docs/arrow-api.md) for the reverse-engineered
+API reference.
+
 ## Quick Start
 
 Both repos are expected to live side-by-side (the paths are relative, so any
@@ -175,6 +186,143 @@ bash provision.sh --test-only
 └───────────────────────────────────────────────────────┘
 ```
 
+## ARROW Dongles (No-Flash Variant)
+
+**ARROW** is our internal name for a second type of 4G dongle in the fleet:
+hardware-identical to UZ801 (same Qualcomm USB IDs, same chassis) but shipped
+from the vendor with a **ZTE-style "4G Modem" stock firmware** that exposes a
+JSON API on a web UI at `http://192.168.100.1` (login `admin/admin`).
+
+We don't flash ARROWs — for this batch we configure them in place via the stock
+UI so they interoperate with the Kibu devices exactly like the OpenStick dongles
+do (same SSID + PSK scheme), and set the correct Vodafone IoT APN so the M2M
+SIMs can get data.
+
+### What `provision-arrow.sh` does
+
+| Step | Target | API call |
+|---|---|---|
+| 1 | Login | `POST /ajax {funcNo:1000, username, password}` |
+| 2 | Read IMEI, firmware version | returned by login |
+| 3 | Set WiFi SSID to `GA-<IMEI-last-4>` | `funcNo:1007 {ssid, maxSta}` |
+| 4 | Set WiFi PSK to HMAC-SHA256(`OPENSTICK_WIFI_SECRET`, SSID)[:16] (WPA2-PSK) | `funcNo:1010 {encryp_type:4, pwd}` |
+| 5 | Write APN (from `provision.conf`) as profile 1, no user/pwd, auth=0 | `funcNo:1017 {no:1, name, apn, user:"", pwd:"", auth:"0"}` |
+| 6 | Activate profile 1 | `funcNo:1018 {profile_num:1}` |
+| 7 | Change admin web-UI password from `admin` to `ARROW_ADMIN_PASSWORD` | `funcNo:1020 {oldpwd, newpwd}` |
+| 8 | Verify by reading back SSID / PSK / APN | `funcNo:1006, 1009, 1016` |
+| 9 | **LTE internet probe:** check the ARROW reports a WAN IP distinct from its LAN IP, then HTTPS GET `LTE_PROBE_URL` through the ARROW's USB interface (temporary `/32` route, binds via `curl --interface`). Proves the Vodafone IoT APN allow-list actually routes to the probe host. | `funcNo:1002` + real traffic |
+| 10 | Record to DB (`dongle_type='ARROW'`, `firmware_version='ARROW:<vendor-fw>'`); parked row on verify mismatch | `db_record_device` / `db_record_parked` |
+
+**Skipped (by design — not applicable to ARROW):** flash, SSH, NetBird,
+modem-firmware heal, LED service, RNDIS mode, hostname, timezone. The ARROW
+firmware handles modem autoconnect itself.
+
+### What doesn't go into the DB (and why)
+
+The stock ZTE UI doesn't expose: hardware serial number, HWID, MSM_ID, eMMC
+sectors, device-tree model/compatible, IMSI, SIM operator, MSISDN. Those
+columns stay `NULL` for ARROW rows — which is why we store the literal
+`firmware_version="ARROW:UZ801-V2.3.13"` (or whatever the vendor reports) so
+ARROW rows are obvious in fleet reports.
+
+### Kibu compatibility
+
+An OpenStick dongle and an ARROW dongle with the same last-4-IMEI-digits
+produce **identical** SSID + PSK. A Kibu paired with one will pair with the
+other without reconfiguration — that's the whole reason for running ARROWs
+through this tool.
+
+### Duplicate detection (ARROW)
+
+Before writing to the DB the provisioner checks whether the `qr_code`,
+`imsi`, or `iccid` are already recorded **against a different IMEI**:
+
+| Collision | Behavior | Rationale |
+|---|---|---|
+| Same IMEI (any other field matches) | Silent UPSERT | Normal re-provisioning |
+| Different IMEI, **same QR** | **Hard error** — requires `FORCE_DUP=1` | Almost always means the operator scanned the wrong QR sticker |
+| Different IMEI, **same IMSI** | Warn + proceed | SIMs can legitimately move between dongles (replacement/RMA) |
+| Different IMEI, **same ICCID** | Warn + proceed | Same reason as IMSI |
+
+```bash
+# Override a QR collision (rare — only use after verifying the QR sticker):
+FORCE_DUP=1 bash provision-arrow.sh --qr-code SIM-WIN-00000045
+```
+
+### Quick start (ARROW)
+
+```bash
+cd ~/git/OpenStick-Provisioner
+
+# 1. One-time: pick an admin password for the ARROW web UI (static across all
+#    ARROWs in the fleet). Must not be 'admin' or 'openstick'.
+#    Add to .env:
+echo "ARROW_ADMIN_PASSWORD=<pick-a-secret>" >> .env
+
+# 2. Insert the Vodafone IoT SIM into the ARROW BEFORE plugging it in. The
+#    LTE probe at the end of provisioning needs the SIM to be present and
+#    attached. (SSID/PSK/APN config writes work without a SIM, but then the
+#    LTE probe can't confirm carrier reachability — the row will be written
+#    as provisioned but the LTE column will read 'no_wan_ip'.)
+
+# 3. Plug the ARROW into USB. It presents an RNDIS interface and hands out a
+#    DHCP lease on 192.168.100.0/24 (NOT 192.168.68.0/24 like OpenStick).
+nmcli device show enx* | grep IP4.ADDRESS   # expect 192.168.100.xxx
+
+# 4. Refresh sudo so the LTE probe can add/remove its temporary /32 route
+#    without a prompt mid-run:
+sudo -v
+
+# 5. Provision
+bash provision-arrow.sh --qr-code SIM-WIN-00000001
+
+# 6. Re-runs on an already-provisioned ARROW work — the script tries admin/admin
+#    first, then falls back to ARROW_ADMIN_PASSWORD for login.
+```
+
+### Host-internet isolation during LTE probe
+
+The LTE probe routes **only the single test IP** via the ARROW (using a
+`/32` host route + `curl --interface <usb-iface>`). The host's default
+route stays on WiFi throughout. The `/32` is removed unconditionally via
+a shell trap, even on Ctrl-C.
+
+Combined with the pre-existing `dongle-local` NM profile (`ipv4.never-default`),
+there is no path by which the laptop can accidentally route its own traffic
+through the ARROW — neither during provisioning nor afterwards.
+
+### CLI flags (ARROW)
+
+| Flag | Description | Default |
+|---|---|---|
+| `--qr-code <CODE>` | Set QR code directly, skip interactive prompt | _(interactive prompt)_ |
+| `--skip-admin-pwd` | Don't change the admin web-UI password (leave it at whatever it is — only useful for debugging) | `false` |
+
+### Environment variables (ARROW)
+
+| Variable | Default | Source | Purpose |
+|---|---|---|---|
+| `LTE_PROBE_URL_ARROW` | `$LTE_PROBE_URL` or `https://ghcr.io/` | `provision.conf` / env | Target of the LTE probe. Must be a host whitelisted by the APN's ACL (the Vodafone IoT APN blackholes everything else). Falls back to `LTE_PROBE_URL` so both scripts can share a single setting |
+
+### Exit codes (ARROW)
+
+| Code | Meaning |
+|---|---|
+| 0 | Success (SSID, PSK, APN all verified + DB recorded) |
+| 1 | Any step failed (DB row written as `parked_arrow_config_fail` if verification mismatch) |
+
+### Troubleshooting (ARROW)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `HTTP 000` from probe step | Dongle not on `192.168.100.0/24` | `nmcli device show enx*` — if no IPv4, wait ~20s for DHCP. If still nothing, unplug/replug |
+| `Login failed with both admin/admin and ARROW_ADMIN_PASSWORD` | Unit has a third password (previously hand-configured) | Factory-reset via the device's reset pinhole, then re-run |
+| `verify mismatch on SSID/PSK/APN` | Firmware rejected the write silently | Re-run once — the ZTE firmware is occasionally flaky on the first write after a fresh boot |
+| DB row shows `firmware_version='ARROW:'` (empty after the colon) | The login response didn't include `fwversion` (older UI build) | Harmless — the row is still a valid ARROW record |
+| `LTE probe: ARROW reports no WAN IP (IP=192.168.100.1, wlan_ip=192.168.100.1)` | No SIM / SIM not registered / APN not applied yet | Insert SIM, wait ~30s for carrier attach, re-run with `--skip-admin-pwd` if admin pwd already changed |
+| `LTE probe: curl failed reaching <host> (HTTP 000)` | Probe host is not on the APN ACL | Change `LTE_PROBE_URL_ARROW` in `provision.conf` to a host that IS on the ACL (e.g. `https://api.netbird.io/` for Vodafone IoT) |
+| `LTE probe: couldn't add /32 route (sudo not passwordless?)` | `sudo` credential cache expired | Run `sudo -v` before `provision-arrow.sh` to cache credentials. The probe degrades to API-only (the config + WAN-IP check still run) but won't confirm carrier reachability |
+
 ## Route Guard
 
 When the dongle boots with RNDIS enabled, it presents a USB ethernet interface
@@ -287,7 +435,9 @@ This file is gitignored. See `database.conf.example` for a template.
 | `netbird_ip` | `TEXT` | NetBird VPN IP address |
 | `netbird_hostname` | `TEXT` | NetBird peer name (= dongle hostname) |
 | `hostname` | `TEXT` | Dongle hostname (e.g. `ga-3112`) |
-| `dongle_type` | `TEXT` | `UZ801`, `JZ0145-v33`, or `unknown` |
+| `brand` | `TEXT` | Firmware / provisioning flavor: `OpenStick` or `ARROW` (NULL for pre-2026-04 rows) |
+| `dongle_type` | `TEXT` | Hardware variant: `UZ801`, `JZ0145-v33`, or `unknown` |
+| `iccid` | `TEXT` (indexed) | SIM ICCID (printed on the physical card) — unique per SIM |
 | `hwid` | `TEXT` | Full Qualcomm HWID (e.g. `0x007050e100000000`) |
 | `msm_id` | `TEXT` | Chip family ID (e.g. `0x007050e1` = MSM8916/APQ8016) |
 | `emmc_sectors` | `BIGINT` | eMMC size in 512-byte sectors |
@@ -437,11 +587,12 @@ The shared secret is in `.env` (never committed).
 
 ### Secrets (`.env`)
 
-| Setting | Description |
-|---------|-------------|
-| `OPENSTICK_WIFI_SECRET` | 256-bit hex key for WiFi PSK derivation |
-| `NETBIRD_SETUP_KEY` | NetBird VPN setup key (from NetBird dashboard) |
-| `ROOT_PASSWORD` | Root password set during provisioning |
+| Setting | Used by | Description |
+|---------|---------|-------------|
+| `OPENSTICK_WIFI_SECRET` | `provision.sh`, `provision-arrow.sh` | 256-bit hex key for WiFi PSK derivation (fleet-wide). Shared so OpenStick and ARROW dongles with the same last-4 IMEI produce identical PSKs |
+| `NETBIRD_SETUP_KEY` | `provision.sh` | NetBird VPN setup key (from NetBird dashboard) |
+| `ROOT_PASSWORD` | `provision.sh` | SSH root password set during OpenStick provisioning |
+| `ARROW_ADMIN_PASSWORD` | `provision-arrow.sh` | Web-UI admin password for ARROW dongles. Static across all ARROWs. Must not be `admin` or `openstick` |
 
 ## File Structure
 
@@ -450,10 +601,14 @@ The shared secret is in `.env` (never committed).
 ├── .env                  # Actual secrets (gitignored)
 ├── database.conf.example # Template for database connection
 ├── database.conf         # Actual DB credentials (gitignored)
-├── provision.sh          # Main provisioning script
+├── provision.sh          # Primary provisioning script (flash + configure OpenStick dongles)
+├── provision-arrow.sh    # Secondary: configure ARROW dongles via stock web API (no flash)
 ├── provision.conf        # Fleet configuration (APN, timezone, version, etc.)
-├── db.sh                 # Database helper functions (sourced by provision.sh)
+├── db.sh                 # Database helper functions (sourced by provision.sh / provision-arrow.sh)
 ├── test-provision.sh     # Provisioning verification test suite
+├── docs/
+│   └── arrow-api.md      # Reverse-engineered ZTE "4G Modem" web API reference
+├── logs/                 # Per-run provisioning logs (gitignored)
 └── README.md
 ```
 

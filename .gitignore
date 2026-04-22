@@ -11,3 +11,6 @@ backup/
 *.raw
 *.img
 .playwright-mcp/
+
+# Per-provisioning logs
+logs/

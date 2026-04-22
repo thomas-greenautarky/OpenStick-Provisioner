@@ -1,8 +1,31 @@
 # OpenStick-Provisioner — TODO
 
 Items tracked here belong to the **provisioning pipeline** (provision.sh,
-test-provision.sh, db.sh, setup-host.sh). Rootfs-side TODOs live in
-`USB-Dongle-OpenStick/TODO.md`.
+provision-arrow.sh, test-provision.sh, db.sh, setup-host.sh). Rootfs-side
+TODOs live in `USB-Dongle-OpenStick/TODO.md`.
+
+## ARROW dongles (no-flash variant)
+
+- [ ] **Active verification of the configured ARROW** — today
+      `provision-arrow.sh` reads SSID/PSK/APN back via the web API and
+      compares, but doesn't prove the **radio is actually beaconing** with
+      the new SSID or that the APN change produced a working LTE session.
+      Parallels the existing OpenStick "WiFi hotspot: passive vs. active
+      verification" TODO below. Probably wants to be folded into the same
+      active-test feature when that lands.
+
+- [ ] **Admin password rotation helper** for when `ARROW_ADMIN_PASSWORD` is
+      leaked / rotated. Today a rotation requires walking each ARROW unit
+      back through `provision-arrow.sh` with the new value in `.env` — the
+      script already handles this transparently (re-login falls back to
+      the new-but-now-old value), but a batch mode that reads IMEI → unit
+      IP mapping from the DB and rotates the lot would be nice for larger
+      fleets.
+
+- [ ] **Re-verify funcNo map** on any ARROW firmware other than
+      `UZ801-V2.3.13` before trusting [docs/arrow-api.md](docs/arrow-api.md).
+      Vendor firmware varies; the funcNo values have been seen to shift on
+      unrelated ZTE OEMs.
 
 ## Remove after rootfs catches up
 
@@ -70,10 +93,98 @@ test-provision.sh, db.sh, setup-host.sh). Rootfs-side TODOs live in
       (ship a public key in the rootfs, disable password auth). Today the
       provisioner still uses `openstick` as default password.
 
+- [ ] **Per-dongle root password, deterministically derived from the QR code**
+      (DISCUSS before implementing):
+      ```
+      ROOT_PW = sha256(ROOT_PW_SECRET || QR_CODE)[:16]
+      ```
+      Today all provisioned dongles share the same `ROOT_PASSWORD` from
+      `.env` — a single leak compromises the whole fleet. A per-dongle
+      derivation gives us:
+      - one compromised dongle ≠ fleet compromise
+      - no DB lookup needed to find a specific dongle's password — the
+        back office can reconstruct it from the QR + the secret alone
+        (same trick as the WiFi PSK derivation already uses)
+      - still reproducible (lose the DB? as long as the QR sticker is on
+        the device and the secret is in a vault, you can always log in)
+
+      Open questions for the discussion:
+      1. Where to store `ROOT_PW_SECRET`? Same `.env` as
+         `OPENSTICK_WIFI_SECRET`, or a separate vault entry (it's higher-
+         impact than the WiFi PSK secret — compromise = root on every
+         dongle)?
+      2. Do we still record the *derived* password in the DB for
+         operational convenience, or force the back office to derive on
+         demand? Storing it is DRY but widens the blast radius of a DB
+         breach; deriving on demand keeps the DB useless without the
+         secret.
+      3. Migration: run a batch `--skip-flash` re-provision on the
+         existing fleet to rotate everyone to per-dongle passwords,
+         or accept a mixed-mode transition period?
+      4. Does this interact with the SSH-key-only hardening above? If we
+         go key-only, per-dongle passwords become a defense-in-depth
+         nicety rather than the primary auth — still worth it for
+         recovery/emergency access.
+
 - [ ] Add `provision.conf` option to select LTE probe URL per fleet —
       currently hardcoded to `api.netbird.io`, but that FQDN is
       carrier-ACL-sensitive. `LTE_PROBE_URL` env override is already
       wired in `test-provision.sh`; expose it in `provision.conf`.
+
+## WiFi hotspot: passive vs. active verification (DISCUSS)
+
+- [ ] Today's WiFi tests (test-provision.sh §3 + test-dongle.sh §7) are
+      **purely config-based**: NM connection active, SSID matches, PSK
+      matches HMAC derivation, channel set, WCNSS firmware+NV present,
+      `wlan0` interface exists. None of these touch the actual radio.
+
+      A dongle that silently **fails to beacon** (e.g. hostapd crashed
+      right after start, wlan0 stuck in `dormant`, calibration botched
+      but firmware loaded) would still PASS all today's checks. Only a
+      customer would notice — when their device can't see the SSID.
+
+      Two escalation levels to discuss:
+
+      **Level 1 — cheap local sanity (5 min to build):**
+      ```
+      iw dev wlan0 info            # must show type=AP, channel=<WIFI_CHANNEL>
+      ip -br link show wlan0       # must be UP (not DOWN/dormant)
+      iw dev wlan0 get hostapd-cli # (on some builds) lists running state
+      ```
+      Runs on the dongle itself, no extra hardware. Catches hostapd
+      crashes and interface-down states. Doesn't prove the radio is
+      *transmitting*, but rules out the top two failure modes.
+
+      **Level 2 — real end-to-end (heavier):**
+      A second device (a dedicated test Kibu, a Raspberry Pi with a
+      USB WiFi dongle, or the provisioning laptop's WiFi *if* it's
+      free) scans for the SSID, connects with the derived PSK, pulls
+      an IP via DHCP, and makes an HTTPS request that has to route
+      through the dongle's LTE back to the internet. That proves the
+      full chain: radio → AP → DHCP → NAT → LTE.
+
+      Open questions:
+      1. Is there a dedicated test device at the provisioning station,
+         or would we ask the operator to bring their phone / laptop?
+      2. The provisioning laptop's WiFi is normally in use for the
+         *uplink* (NM-managed). Adding a scan against the dongle-AP
+         requires either a second WiFi dongle on the laptop or
+         sharing the iwlwifi radio carefully.
+      3. Do we want the active test to block provisioning (FAIL blocks
+         DB write) or only log? An active test that depends on external
+         hardware shouldn't block the critical path.
+      4. Level 2 overlaps with the planned Kibu+Funnel end-to-end test
+         (also in this TODO) — probably these should be the same feature,
+         not two separate ones.
+
+      **Hard non-goal** (lessons from setup-host.sh's `unmanaged=…`
+      disaster earlier this session): any active test MUST NOT touch
+      the provisioning laptop's own WiFi uplink. NM-managed primary
+      interface stays off-limits. Test hardware lives external to the
+      laptop: a dedicated Kibu/Pi, or a second USB WiFi radio with its
+      own NM profile scoped to that device only. The laptop-WiFi
+      compromise pattern is: if the only option is "borrow the
+      laptop's own radio", we don't ship the active test.
 
 ## Validation tests
 
