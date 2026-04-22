@@ -196,42 +196,82 @@ api_write_retry() {
 #   (1) Ask the ARROW via funcNo:1002 whether it has a WAN IP distinct from
 #       its LAN IP. No SIM / no attach → IP == wlan_ip == 192.168.100.1. When
 #       LTE is really up, IP becomes the carrier-assigned address (10.x / 100.x
-#       on Vodafone). This is cheap and doesn't send any traffic.
+#       on Vodafone). This is cheap and doesn't send any traffic. If the
+#       first attempt times out, we force a reattach by cycling the APN
+#       profile (funcNo:1018 0→1) — this reliably un-sticks units that
+#       detached from the carrier (e.g. Vodafone Active.Test idle timeout).
 #   (2) Do a real HTTPS GET to LTE_PROBE_URL_ARROW bound to the ARROW's USB
 #       interface, with a temporary /32 route so only this one IP goes through
 #       the ARROW. Proves: DNS → TCP → TLS → cert validity → carrier ACL pass.
 #
 # Returns 0 on full success, 1 on LTE-not-attached, 2 on HTTPS failure.
 # Arg 1: USB interface name (e.g. enx025304016362).
-probe_lte() {
-    local usb_iface="$1"
-    local resp ip wlan_ip host probe_ip http_code
-    local probe_host_port
 
-    # (1) Ask the ARROW if it thinks LTE is up. On a freshly-provisioned
-    # unit the modem takes 10-60s to attach to the carrier after the APN
-    # is activated — poll up to 60s before giving up, so we don't fail the
-    # probe purely on ordering.
-    local attach_timeout=60
-    local polled=0
+# wait_for_wan_ip TIMEOUT — poll funcNo:1002 until WAN IP != LAN IP, up to
+# TIMEOUT seconds. Echoes the attached WAN IP on success. Returns 1 on
+# timeout, 2 on a hard API error (status query failed).
+wait_for_wan_ip() {
+    local timeout="${1:-60}"
+    local resp ip wlan_ip polled=0
     while :; do
         resp=$(api_call "$(jq -cn --argjson fn "$FN_WAN_STATUS" '{funcNo:$fn}')")
-        api_ok "$resp" || { warn "  LTE probe: status query failed"; return 1; }
+        api_ok "$resp" || return 2
         ip=$(echo "$resp"     | jq -r '.results[0].IP // empty')
         wlan_ip=$(echo "$resp"| jq -r '.results[0].wlan_ip // empty')
         if [ -n "$ip" ] && [ "$ip" != "$wlan_ip" ] && [ "$ip" != "192.168.100.1" ]; then
-            break
+            echo "$ip"
+            [ "$polled" -gt 0 ] && log "  (attach took ${polled}s)" >&2
+            return 0
         fi
-        if [ "$polled" -ge "$attach_timeout" ]; then
-            warn "  LTE probe: ARROW reports no WAN IP after ${attach_timeout}s (IP=$ip, wlan_ip=$wlan_ip)."
-            warn "  Possible causes: no SIM / SIM not registered / APN wrong."
-            return 1
-        fi
-        [ "$polled" = 0 ] && log "  LTE probe: waiting for carrier attach (WAN IP)..."
+        [ "$polled" -ge "$timeout" ] && return 1
+        [ "$polled" = 0 ] && log "  LTE probe: waiting for carrier attach (WAN IP)..." >&2
         sleep 3
         polled=$((polled + 3))
     done
-    log "  LTE probe: ARROW has WAN IP $ip (distinct from LAN $wlan_ip)${polled:+  (attach took ${polled}s)} ✓"
+}
+
+# force_reattach — cycles the APN profile to force the modem to disconnect
+# and re-attach to the carrier. This recovers units whose LTE session has
+# been terminated by the carrier (e.g. Vodafone Active.Test idle timeout)
+# — conn_mode=0 alone does not trigger auto-retry in this firmware.
+force_reattach() {
+    log "  Force re-attach: cycling APN profile (1018 0→1)..." >&2
+    api_call "$(jq -cn --argjson fn "$FN_ACT_APN" --arg p "0" \
+        '{funcNo:$fn, profile_num:$p}')" >/dev/null 2>&1
+    sleep 5
+    api_call "$(jq -cn --argjson fn "$FN_ACT_APN" --arg p "1" \
+        '{funcNo:$fn, profile_num:$p}')" >/dev/null 2>&1
+}
+
+probe_lte() {
+    local usb_iface="$1"
+    local ip wlan_ip host probe_ip http_code
+    local probe_host_port rc
+
+    # (1a) First attempt — normal attach window.
+    ip=$(wait_for_wan_ip 60); rc=$?
+    if [ "$rc" -eq 2 ]; then
+        warn "  LTE probe: status query failed"
+        return 1
+    fi
+    if [ "$rc" -ne 0 ]; then
+        # No attach within 60s. Could be a stale carrier session from an
+        # earlier provisioning — try forcing a re-attach, then poll again.
+        warn "  LTE probe: no WAN IP after 60s — attempting force re-attach"
+        force_reattach
+        ip=$(wait_for_wan_ip 60); rc=$?
+        if [ "$rc" -ne 0 ]; then
+            warn "  LTE probe: still no WAN IP after force re-attach."
+            warn "  Possible causes: no SIM / SIM not registered / APN wrong / Active.Test idle-barred."
+            return 1
+        fi
+        log "  LTE probe: recovered via force re-attach"
+    fi
+
+    # Re-read LAN IP for the log line below.
+    local resp=$(api_call "$(jq -cn --argjson fn "$FN_WAN_STATUS" '{funcNo:$fn}')")
+    wlan_ip=$(echo "$resp" | jq -r '.results[0].wlan_ip // empty')
+    log "  LTE probe: ARROW has WAN IP $ip (distinct from LAN $wlan_ip) ✓"
 
     # (2) Real HTTPS probe through the ARROW.
     host=$(echo "$LTE_PROBE_URL_ARROW" | awk -F/ '{print $3}' | cut -d: -f1)
